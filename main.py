@@ -14,7 +14,12 @@ TOUCHED_ALERTS     = {}
 
 def send_telegram(message):
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
     try:
         r = requests.post(url, json=payload, timeout=10)
         return r.status_code == 200
@@ -100,30 +105,37 @@ def get_price_map():
         print(f"[PRICE MAP ERROR] {e}")
     return {}
 
-def age_str(ts):
-    s = time.time() - ts
-    return f"{int(s//3600)}h {int((s%3600)//60)}m ago"
-
 def fmt_price(p):
     dec = 6 if p < 0.01 else 4 if p < 1 else 2
     return f"{p:.{dec}f}"
 
+def make_tradingview_link(symbol):
+    # Convert MEXC symbol to TradingView format
+    coin = symbol.replace("_USDT", "")
+    return f"https://www.tradingview.com/chart/?symbol=MEXC%3A{coin}USDT&interval=60"
+
 def make_alert(symbol, ob, price):
-    coin  = symbol.replace("_USDT", "")
-    emoji = "🟢" if ob["type"] == "BUY" else "🔴"
-    zone  = "BUY ZONE" if ob["type"] == "BUY" else "SELL ZONE"
+    coin    = symbol.replace("_USDT", "")
+    emoji   = "🟢" if ob["type"] == "BUY" else "🔴"
+    zone    = "BUY ZONE" if ob["type"] == "BUY" else "SELL ZONE"
+    tv_link = make_tradingview_link(symbol)
+
     return (
         f"{emoji} <b>ORDER BLOCK ALERT</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📌 <b>Coin:</b> #{coin}/USDT\n"
         f"⚡ <b>Signal:</b> {zone} TOUCHED\n"
-        f"💰 <b>Price:</b> {fmt_price(price)}\n"
+        f"💰 <b>Current Price:</b> {fmt_price(price)}\n"
         f"📊 <b>OB Zone:</b> {fmt_price(ob['bottom'])} — {fmt_price(ob['top'])}\n"
-        f"🕐 <b>Timeframe:</b> 1 Hour\n"
-        f"⏳ <b>OB Formed:</b> {age_str(ob['time'])}\n"
-        f"⏰ <b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>Exchange:</b> MEXC Futures"
+        f"📈 <b>View Chart (1H):</b>\n"
+        f'<a href="{tv_link}">Open {coin}/USDT on TradingView ↗</a>\n'
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<i>If you want to trade this:\n"
+        f"1. Check the chart for a valid setup\n"
+        f"2. Plan your Entry, Stop Loss &amp; Target\n"
+        f"3. Execute with proper risk management\n\n"
+        f"Not Financial Advice | DYOR</i>"
     )
 
 def run():
@@ -141,7 +153,8 @@ def run():
         "⏱ Timeframe: 1 Hour\n"
         "📉 Volume Filter: &gt;5M USDT only\n"
         "🔕 Cooldown: 1 alert per coin per 4 hours\n"
-        "✅ Fewer, better quality alerts now!"
+        "🔗 TradingView chart link added in alerts!\n"
+        "✅ Cleaner alerts now!"
     )
 
     symbols             = []
@@ -183,7 +196,7 @@ def run():
                             coin = symbol.replace("_USDT", "")
                             print(f"  ⚡ {coin} | {ob['type']} OB @ {fmt_price(price)}")
                             if send_telegram(make_alert(symbol, ob, price)):
-                                TOUCHED_ALERTS[ob_key]  = now
+                                TOUCHED_ALERTS[ob_key]   = now
                                 TOUCHED_ALERTS[coin_key] = now
                                 alerts_sent += 1
                                 print(f"     ✅ Sent! Next alert for {coin} after 4h")
