@@ -8,6 +8,8 @@ MEXC_BASE_URL      = "https://contract.mexc.com/api/v1"
 TIMEFRAME          = "Min60"
 CHECK_INTERVAL     = 60
 OB_MAX_AGE_HOURS   = 48
+ALERT_COOLDOWN     = 4 * 3600
+MIN_VOLUME_USDT    = 5_000_000
 TOUCHED_ALERTS     = {}
 
 def send_telegram(message):
@@ -25,12 +27,19 @@ def get_top_symbols(limit=500):
         r    = requests.get(f"{MEXC_BASE_URL}/contract/ticker", timeout=20)
         data = r.json()
         if data.get("success"):
-            tickers = [t for t in data["data"]
-                       if "_USDT" in t.get("symbol", "")
-                       and float(t.get("volume24", 0) or 0) > 0]
-            tickers.sort(key=lambda x: float(x.get("volume24", 0) or 0), reverse=True)
+            tickers = []
+            for t in data["data"]:
+                if "_USDT" not in t.get("symbol", ""):
+                    continue
+                vol      = float(t.get("volume24", 0) or 0)
+                price    = float(t.get("lastPrice", 0) or 0)
+                vol_usdt = vol * price
+                if vol_usdt < MIN_VOLUME_USDT:
+                    continue
+                tickers.append({"symbol": t["symbol"], "vol_usdt": vol_usdt})
+            tickers.sort(key=lambda x: x["vol_usdt"], reverse=True)
             syms = [t["symbol"] for t in tickers]
-            print(f"[INFO] {len(syms)} symbols found — monitoring top {min(limit, len(syms))}")
+            print(f"[INFO] {len(syms)} coins passed volume filter — top {min(limit,len(syms))} selected")
             return syms[:limit]
     except Exception as e:
         print(f"[SYMBOL ERROR] {e}")
@@ -120,20 +129,23 @@ def make_alert(symbol, ob, price):
 def run():
     print("=" * 55)
     print("  MEXC 1H Order Block Scanner  |  Top 500 Coins")
-    print("  OB Filter : Last 48 Hours")
-    print("  Alerts    : @futureforalphapro")
+    print(f"  Volume Filter : >5M USDT 24h")
+    print(f"  OB Age Filter : Last 48h only")
+    print(f"  Alert Cooldown: 4h per coin")
+    print("  Alerts -> @futureforalphapro")
     print("=" * 55)
 
     send_telegram(
-        "🚀 <b>Order Block Scanner LIVE!</b>\n"
+        "🚀 <b>Order Block Scanner UPDATED!</b>\n"
         "📊 Monitoring: Top 500 MEXC Futures\n"
         "⏱ Timeframe: 1 Hour\n"
-        "🔍 OB Filter: Last 48 hours only\n"
-        "✅ Alerts will appear here automatically."
+        "📉 Volume Filter: &gt;5M USDT only\n"
+        "🔕 Cooldown: 1 alert per coin per 4 hours\n"
+        "✅ Fewer, better quality alerts now!"
     )
 
-    symbols              = []
-    last_symbol_refresh  = 0
+    symbols             = []
+    last_symbol_refresh = 0
 
     while True:
         try:
@@ -144,8 +156,8 @@ def run():
                 last_symbol_refresh = now
 
             print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] Scanning {len(symbols)} coins...")
-            price_map    = get_price_map()
-            alerts_sent  = 0
+            price_map   = get_price_map()
+            alerts_sent = 0
 
             for idx, symbol in enumerate(symbols):
                 try:
@@ -153,28 +165,35 @@ def run():
                     if not price:
                         continue
 
+                    coin_key = f"{symbol}_last_alert"
+                    if coin_key in TOUCHED_ALERTS:
+                        if now - TOUCHED_ALERTS[coin_key] < ALERT_COOLDOWN:
+                            continue
+
                     candles = get_candles(symbol, 100)
                     if not candles or len(candles) < 15:
                         continue
 
                     obs = detect_order_blocks(candles)
                     for ob in obs:
-                        key = f"{symbol}_{ob['type']}_{ob['time']}"
-                        if key in TOUCHED_ALERTS and now - TOUCHED_ALERTS[key] < 14400:
+                        ob_key = f"{symbol}_{ob['type']}_{ob['time']}"
+                        if ob_key in TOUCHED_ALERTS and now - TOUCHED_ALERTS[ob_key] < ALERT_COOLDOWN:
                             continue
                         if is_touching(price, ob):
-                            coin = symbol.replace("_USDT","")
-                            print(f"  ⚡ {coin} | {ob['type']} OB touched @ {fmt_price(price)}")
+                            coin = symbol.replace("_USDT", "")
+                            print(f"  ⚡ {coin} | {ob['type']} OB @ {fmt_price(price)}")
                             if send_telegram(make_alert(symbol, ob, price)):
-                                TOUCHED_ALERTS[key] = now
+                                TOUCHED_ALERTS[ob_key]  = now
+                                TOUCHED_ALERTS[coin_key] = now
                                 alerts_sent += 1
-                                print(f"     ✅ Alert sent!")
+                                print(f"     ✅ Sent! Next alert for {coin} after 4h")
                             time.sleep(1.5)
+                            break
 
                     time.sleep(0.35)
 
                     if (idx + 1) % 100 == 0:
-                        print(f"  ... {idx+1}/{len(symbols)} done")
+                        print(f"  ... {idx+1}/{len(symbols)} scanned")
 
                 except Exception as e:
                     print(f"  [ERR] {symbol}: {e}")
