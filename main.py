@@ -11,24 +11,23 @@ MEXC_BASE_URL       = "https://contract.mexc.com/api/v1"
 TIMEFRAME           = "Min60"
 CHECK_INTERVAL      = 60
 OB_MAX_AGE_HOURS    = 48
-ALERT_COOLDOWN      = 4 * 3600
-MIN_VOLUME_USDT     = 5_000_000
-VOLUME_MULTIPLIER   = 1.5
-MIN_BODY_RATIO      = 0.4
+ALERT_COOLDOWN        = 1 * 3600  # min 1 hour gap between alerts for same coin
+MAX_ALERTS_PER_DAY    = 4         # max 4 alerts per coin per UTC day
+MIN_VOLUME_USDT       = 5_000_000
+VOLUME_MULTIPLIER     = 1.5
+MIN_BODY_RATIO        = 0.4
 
 # ── NEW CONFIGS ───────────────────────────────
-# How far (%) an opposing OB can be before we ignore it as "too far away"
 OPPOSING_OB_BLOCK_PCT = 5.0   # if SELL OB is within 5% above price → block BUY signal
-
-# Minimum % price must have moved AWAY from OB before returning (mitigation)
 MITIGATION_MOVE_PCT   = 1.5   # price must move 1.5% away from OB top/bottom
 
 # RSI thresholds
 RSI_PERIOD            = 14
-RSI_BUY_MAX           = 65    # don't buy if RSI > 65 (already overbought)
-RSI_SELL_MIN          = 35    # don't sell if RSI < 35 (already oversold)
+RSI_BUY_MAX           = 65
+RSI_SELL_MIN          = 35
 
-TOUCHED_ALERTS: dict = {}
+TOUCHED_ALERTS:    dict = {}   # ob_key/coin_key → last alert unix timestamp
+DAILY_ALERT_COUNT: dict = {}   # coin → {"date": "YYYY-MM-DD", "count": N}
 
 # ─────────────────────────────────────────────
 #  TELEGRAM
@@ -119,6 +118,54 @@ def make_tradingview_link(symbol: str) -> str:
 def average_volume(candles: list[dict]) -> float:
     vols = [c["vol"] for c in candles if c["vol"] > 0]
     return sum(vols) / len(vols) if vols else 0
+
+# ─────────────────────────────────────────────
+#  ALERT RATE LIMITER
+# ─────────────────────────────────────────────
+def can_alert(coin: str, now: float) -> tuple[bool, str]:
+    """
+    Two-layer check:
+      1. Hourly cooldown  — min 1h between any alert for this coin
+      2. Daily cap        — max MAX_ALERTS_PER_DAY alerts per UTC day
+
+    Returns (allowed: bool, reason: str)
+    """
+    coin_key  = f"{coin}_last_alert"
+    today_str = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d")
+
+    # ── 1. Hourly cooldown ───────────────────
+    last_sent = TOUCHED_ALERTS.get(coin_key, 0)
+    if now - last_sent < ALERT_COOLDOWN:
+        wait_min = int((ALERT_COOLDOWN - (now - last_sent)) / 60)
+        return False, f"cooldown ({wait_min}m left)"
+
+    # ── 2. Daily cap ─────────────────────────
+    entry = DAILY_ALERT_COUNT.get(coin, {"date": "", "count": 0})
+    if entry["date"] != today_str:
+        # New UTC day — reset counter
+        entry = {"date": today_str, "count": 0}
+        DAILY_ALERT_COUNT[coin] = entry
+
+    if entry["count"] >= MAX_ALERTS_PER_DAY:
+        return False, f"daily cap reached ({MAX_ALERTS_PER_DAY}/day)"
+
+    return True, "ok"
+
+
+def record_alert(coin: str, ob_key: str, now: float) -> None:
+    """Mark alert as sent — update both cooldown and daily counter."""
+    coin_key  = f"{coin}_last_alert"
+    today_str = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d")
+
+    TOUCHED_ALERTS[ob_key]  = now
+    TOUCHED_ALERTS[coin_key] = now
+
+    entry = DAILY_ALERT_COUNT.get(coin, {"date": today_str, "count": 0})
+    if entry["date"] != today_str:
+        entry = {"date": today_str, "count": 0}
+    entry["count"] += 1
+    DAILY_ALERT_COUNT[coin] = entry
+
 
 # ─────────────────────────────────────────────
 #  RSI CALCULATION  (NEW)
@@ -690,10 +737,12 @@ def run():
                     if not price:
                         continue
 
-                    coin_key = f"{symbol}_last_alert"
-                    if coin_key in TOUCHED_ALERTS:
-                        if now - TOUCHED_ALERTS[coin_key] < ALERT_COOLDOWN:
-                            continue
+                    coin = symbol.replace("_USDT", "")
+
+                    # ── Per-coin rate limit (1h cooldown + 4/day cap) ──
+                    allowed, reason = can_alert(coin, now)
+                    if not allowed:
+                        continue
 
                     candles = get_candles(symbol, 120)
                     if not candles or len(candles) < 20:
@@ -706,6 +755,7 @@ def run():
                     for ob in obs:
                         ob_key = f"{symbol}_{ob['type']}_{ob['time']}"
 
+                        # per-OB dedup (don't re-alert same OB within cooldown)
                         if ob_key in TOUCHED_ALERTS:
                             if now - TOUCHED_ALERTS[ob_key] < ALERT_COOLDOWN:
                                 continue
@@ -753,16 +803,15 @@ def run():
                             continue
 
                         # ── All checks passed → send alert ───────────────
-                        coin = symbol.replace("_USDT", "")
                         print(
                             f"  ⚡ {coin} | {ob['type']} OB @ {fmt_price(price)} "
                             f"| RSI {rsi} | BP {bp['bias']} {bp['prob_up']}%↑"
                         )
                         if send_telegram(make_alert(symbol, ob, price, rsi, candles, bp)):
-                            TOUCHED_ALERTS[ob_key]   = now
-                            TOUCHED_ALERTS[coin_key] = now
+                            record_alert(coin, ob_key, now)
                             alerts_sent += 1
-                            print(f"     ✅ Alert sent! Next for {coin} after 4h")
+                            daily = DAILY_ALERT_COUNT[coin]["count"]
+                            print(f"     ✅ Alert sent! [{daily}/{MAX_ALERTS_PER_DAY} today] Next in 1h")
                         time.sleep(1.5)
                         break
 
