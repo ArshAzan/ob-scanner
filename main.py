@@ -338,7 +338,7 @@ def get_price_map() -> dict[str, float]:
     return {}
 
 # ─────────────────────────────────────────────
-#  SUGGEST SL / TP  (NEW)
+#  SUGGEST SL / TP
 # ─────────────────────────────────────────────
 def suggest_sl_tp(ob: dict, price: float) -> tuple[float, float]:
     """
@@ -346,57 +346,295 @@ def suggest_sl_tp(ob: dict, price: float) -> tuple[float, float]:
     SELL → SL just above OB top   (1% buffer), TP = 2× risk below entry
     """
     if ob["type"] == "BUY":
-        sl     = ob["bottom"] * 0.99
-        risk   = price - sl
-        tp     = price + risk * 2
+        sl   = ob["bottom"] * 0.99
+        risk = price - sl
+        tp   = price + risk * 2
     else:
-        sl     = ob["top"] * 1.01
-        risk   = sl - price
-        tp     = price - risk * 2
+        sl   = ob["top"] * 1.01
+        risk = sl - price
+        tp   = price - risk * 2
     return round(sl, 6), round(tp, 6)
 
 # ─────────────────────────────────────────────
-#  ALERT MESSAGE  (improved)
+#  PROBABILITY SCORE
+# ─────────────────────────────────────────────
+def calc_probability_score(
+    ob: dict,
+    rsi: float,
+    candles: list[dict],
+) -> float:
+    """
+    Score 0–100 based on:
+      - RSI confluence   (30 pts)
+      - OB age           (25 pts) — fresher = better
+      - Volume strength  (25 pts) — how much above avg
+      - Body quality     (20 pts) — body/range ratio
+    """
+    score = 0.0
+    is_buy = ob["type"] == "BUY"
+
+    # ── RSI (30 pts) ─────────────────────────
+    if rsi >= 0:
+        if is_buy:
+            # Best score around 30–50 (room to go up)
+            if 25 <= rsi <= 50:
+                score += 30
+            elif 50 < rsi <= 60:
+                score += 20
+            elif rsi < 25:
+                score += 15   # oversold but possible reversal
+            else:
+                score += 5
+        else:
+            # Best score around 50–70 (room to go down)
+            if 50 <= rsi <= 75:
+                score += 30
+            elif 40 <= rsi < 50:
+                score += 20
+            elif rsi > 75:
+                score += 15
+            else:
+                score += 5
+
+    # ── OB Age (25 pts) ──────────────────────
+    age_h = (time.time() - ob["time"]) / 3600
+    if age_h <= 6:
+        score += 25
+    elif age_h <= 12:
+        score += 20
+    elif age_h <= 24:
+        score += 15
+    elif age_h <= 36:
+        score += 8
+    else:
+        score += 3
+
+    # ── Volume strength (25 pts) ─────────────
+    avg_vol = average_volume(candles)
+    ob_candle = next(
+        (c for c in candles if c["time"] == ob["time"]), None
+    )
+    if ob_candle and avg_vol > 0:
+        vol_ratio = ob_candle["vol"] / avg_vol
+        if vol_ratio >= 3.0:
+            score += 25
+        elif vol_ratio >= 2.0:
+            score += 20
+        elif vol_ratio >= 1.5:
+            score += 14
+        else:
+            score += 6
+
+    # ── Body quality (20 pts) ────────────────
+    if ob_candle:
+        ob_range = ob_candle["high"] - ob_candle["low"]
+        if ob_range > 0:
+            body_ratio = abs(ob_candle["close"] - ob_candle["open"]) / ob_range
+            if body_ratio >= 0.8:
+                score += 20
+            elif body_ratio >= 0.65:
+                score += 15
+            elif body_ratio >= 0.5:
+                score += 10
+            else:
+                score += 5
+
+    return round(min(score, 100.0), 1)
+
+# ─────────────────────────────────────────────
+#  10x LEVERAGE PROFIT CALC
+# ─────────────────────────────────────────────
+def calc_10x_profit(entry: float, tp: float, sl: float, is_buy: bool) -> dict:
+    """
+    Returns profit% and loss% at 10x leverage.
+    Formula: pnl% = (price_change / entry) * 100 * leverage
+    """
+    leverage = 10
+    if is_buy:
+        profit_pct = ((tp - entry) / entry) * 100 * leverage
+        loss_pct   = ((entry - sl) / entry) * 100 * leverage
+    else:
+        profit_pct = ((entry - tp) / entry) * 100 * leverage
+        loss_pct   = ((sl - entry) / entry) * 100 * leverage
+    return {
+        "profit": round(profit_pct, 1),
+        "loss":   round(loss_pct, 1),
+    }
+
+# ─────────────────────────────────────────────
+#  BREAKOUT PROBABILITY  (Expo indicator — Pine Script translated)
+# ─────────────────────────────────────────────
+def calc_breakout_probability(candles: list[dict], perc: float = 1.0) -> dict:
+    """
+    Direct Python translation of "Breakout Probability (Expo)" by Zeiierman.
+
+    Logic:
+    ──────
+    For every closed bar i, look at bar i+1 (next bar):
+      • If bar i was GREEN (close > open):
+          - Did bar i+1's HIGH reach bar_i_high + step*level?  → green_hh[level]++
+          - Did bar i+1's LOW  reach bar_i_low  - step*level?  → green_ll[level]++
+      • If bar i was RED   (close < open):
+          - same tracking separately                            → red_hh/red_ll
+
+    Probability = count / total_green_bars  (or total_red_bars)
+
+    Bias for the CURRENT (last) candle:
+      • Last candle green → use green stats → BULLISH if prob_up > prob_down
+      • Last candle red   → use red stats   → BULLISH if prob_up > prob_down
+
+    Extra: also check level 1 (step*1) and level 2 (step*2) for "how strong"
+    the breakout probability is at higher levels.
+    """
+    if len(candles) < 20:
+        return {
+            "bias":        "NEUTRAL",
+            "prob_up":     0.0,
+            "prob_down":   0.0,
+            "prob_up_l1":  0.0,
+            "prob_dn_l1":  0.0,
+            "total_green": 0,
+            "total_red":   0,
+        }
+
+    total_green = 0
+    total_red   = 0
+
+    # Levels 0, 1, 2 counters  [green_hh, green_ll, red_hh, red_ll]
+    counts = [[0, 0, 0, 0] for _ in range(3)]
+
+    for i in range(len(candles) - 1):
+        cur  = candles[i]
+        nxt  = candles[i + 1]
+        step = cur["close"] * (perc / 100)
+
+        is_green = cur["close"] > cur["open"]
+        is_red   = cur["close"] < cur["open"]
+
+        if is_green:
+            total_green += 1
+        elif is_red:
+            total_red += 1
+        else:
+            continue   # doji — skip
+
+        for lvl in range(3):
+            x  = step * lvl
+            hh = nxt["high"] >= cur["high"] + x
+            ll = nxt["low"]  <= cur["low"]  - x
+
+            if is_green:
+                if hh: counts[lvl][0] += 1
+                if ll: counts[lvl][1] += 1
+            else:
+                if hh: counts[lvl][2] += 1
+                if ll: counts[lvl][3] += 1
+
+    # ── Use the LAST candle to decide which stats to read ──
+    last        = candles[-1]
+    last_green  = last["close"] > last["open"]
+
+    def pct(num, denom):
+        return round((num / denom) * 100, 2) if denom > 0 else 0.0
+
+    if last_green:
+        # After green candles historically
+        prob_up    = pct(counts[0][0], total_green)   # level 0 up
+        prob_down  = pct(counts[0][1], total_green)   # level 0 down
+        prob_up_l1 = pct(counts[1][0], total_green)   # level 1 up
+        prob_dn_l1 = pct(counts[1][1], total_green)   # level 1 down
+    else:
+        # After red candles historically
+        prob_up    = pct(counts[0][2], total_red)
+        prob_down  = pct(counts[0][3], total_red)
+        prob_up_l1 = pct(counts[1][2], total_red)
+        prob_dn_l1 = pct(counts[1][3], total_red)
+
+    bias = "BULLISH" if prob_up >= prob_down else "BEARISH"
+
+    return {
+        "bias":        bias,
+        "prob_up":     prob_up,
+        "prob_down":   prob_down,
+        "prob_up_l1":  prob_up_l1,   # at +1% level — stronger breakout probability
+        "prob_dn_l1":  prob_dn_l1,
+        "total_green": total_green,
+        "total_red":   total_red,
+        "last_green":  last_green,
+    }
+
+# ─────────────────────────────────────────────
+#  ALERT MESSAGE
 # ─────────────────────────────────────────────
 def make_alert(
-    symbol: str,
-    ob: dict,
-    price: float,
-    rsi: float,
+    symbol:   str,
+    ob:       dict,
+    price:    float,
+    rsi:      float,
+    candles:  list[dict],
+    bp:       dict,          # breakout probability dict
 ) -> str:
-    coin    = symbol.replace("_USDT", "")
-    is_buy  = ob["type"] == "BUY"
-    emoji   = "🟢" if is_buy else "🔴"
-    signal  = "LONG" if is_buy else "SHORT"
-    bias    = "BULLISH" if is_buy else "BEARISH"
-    tv_link = make_tradingview_link(symbol)
-    ob_age  = round((time.time() - ob["time"]) / 3600, 1)
-    sl, tp  = suggest_sl_tp(ob, price)
+    coin      = symbol.replace("_USDT", "")
+    is_buy    = ob["type"] == "BUY"
+    signal    = "LONG 📈"    if is_buy else "SHORT 📉"
+    bias_str  = "🐂 BULLISH" if is_buy else "🐻 BEARISH"
+    tv_link   = make_tradingview_link(symbol)
+    ob_age    = round((time.time() - ob["time"]) / 3600, 1)
+    sl, tp    = suggest_sl_tp(ob, price)
+    prob      = calc_probability_score(ob, rsi, candles)
+    leverage  = calc_10x_profit(price, tp, sl, is_buy)
+    rsi_str   = f"{rsi:.2f}" if rsi >= 0 else "N/A"
 
-    rsi_str = f"{rsi:.2f}" if rsi >= 0 else "N/A"
+    # ── Breakout probability display ─────────────
+    bp_bias       = bp.get("bias", "NEUTRAL")
+    bp_up         = bp.get("prob_up",    0.0)
+    bp_dn         = bp.get("prob_down",  0.0)
+    bp_up_l1      = bp.get("prob_up_l1", 0.0)
+    bp_dn_l1      = bp.get("prob_dn_l1", 0.0)
+    bp_emoji      = "🐂" if bp_bias == "BULLISH" else ("🐻" if bp_bias == "BEARISH" else "➖")
+    bp_confirm    = "✅" if bp_bias == ("BULLISH" if is_buy else "BEARISH") else "⚠️"
+    bp_agree_txt  = "Confirms signal" if bp_confirm == "✅" else "Diverges from signal"
+
+    # ── Quality label ────────────────────────────
+    if prob >= 75:
+        quality = "🔥 HIGH-QUALITY OB SIGNAL"
+    elif prob >= 60:
+        quality = "⚡ MEDIUM-QUALITY OB SIGNAL"
+    else:
+        quality = "📊 OB SIGNAL"
 
     return (
-        f"{emoji} <b>HIGH-QUALITY OB SIGNAL</b>\n"
+        f"<b>{quality}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 <b>Coin:</b> #{coin}/USDT\n"
-        f"⚡ <b>Signal:</b> {signal}\n"
-        f"🎯 <b>Bias:</b> {bias}\n"
+        f"⚡️ <b>Signal:</b> {signal}\n"
+        f"📊 <b>Bias:</b> {bias_str}\n"
         f"💰 <b>Entry Zone:</b> {fmt_price(ob['bottom'])} — {fmt_price(ob['top'])}\n"
-        f"📍 <b>Current Price:</b> {fmt_price(price)}\n"
+        f"💵 <b>Current Price:</b> {fmt_price(price)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>RSI (14):</b> {rsi_str}\n"
+        f"📉 <b>RSI (14):</b> {rsi_str}\n"
+        f"🎯 <b>OB Probability Score:</b> {prob}%\n"
         f"🕐 <b>OB Age:</b> {ob_age}h ago\n"
         f"✅ <b>Candle Confirmed:</b> Yes (closed candle)\n"
         f"✅ <b>Mitigation:</b> Confirmed\n"
         f"✅ <b>Path Clear:</b> No opposing OB blocking\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛑 <b>Suggested SL:</b> {fmt_price(sl)}\n"
+        f"📊 <b>Breakout Probability (1H):</b>\n"
+        f"   {bp_emoji} <b>Bias:</b> {bp_bias}\n"
+        f"   ⬆️  Up (L0): <b>{bp_up}%</b>  |  Up (L1+1%): <b>{bp_up_l1}%</b>\n"
+        f"   ⬇️  Dn (L0): <b>{bp_dn}%</b>  |  Dn (L1+1%): <b>{bp_dn_l1}%</b>\n"
+        f"   {bp_confirm} <b>{bp_agree_txt}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛡️ <b>Suggested SL:</b> {fmt_price(sl)}\n"
         f"🎯 <b>Suggested TP:</b> {fmt_price(tp)} (1:2 RR)\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>View Chart (1H):</b>\n"
-        f'<a href="{tv_link}">Open {coin}/USDT on TradingView ↗</a>\n'
+        f"💹 <b>10x Leverage Potential:</b>\n"
+        f"   ✅ Profit if TP hit: <b>+{leverage['profit']}%</b>\n"
+        f"   ❌ Loss if SL hit:  <b>-{leverage['loss']}%</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>Always use proper SL\n"
+        f'📈 <a href="{tv_link}">View {coin}/USDT Chart ↗️</a>\n'
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>⚠️ Always use proper SL\n"
         f"High leverage (10x-20x) = tight SL only\n"
         f"Not Financial Advice | DYOR</i>"
     )
@@ -406,27 +644,28 @@ def make_alert(
 # ─────────────────────────────────────────────
 def run():
     print("=" * 60)
-    print("  MEXC 1H Order Block Scanner  |  Top 500 Coins  (v3)")
+    print("  MEXC 1H Order Block Scanner  |  Top 500 Coins  (v4)")
     print(f"  Volume Filter    : >5M USDT 24h")
     print(f"  OB Vol Filter    : {VOLUME_MULTIPLIER}x avg candle volume")
     print(f"  Body Filter      : ≥{int(MIN_BODY_RATIO*100)}% body/range ratio")
     print(f"  Mitigation       : FIXED — price must RETURN to zone")
     print(f"  Opposing OB Blk  : Block if opposing OB within {OPPOSING_OB_BLOCK_PCT}%")
     print(f"  RSI Filter       : BUY ≤{RSI_BUY_MAX} | SELL ≥{RSI_SELL_MIN}")
+    print(f"  Breakout Prob    : OB signal must align with breakout bias")
     print(f"  OB Age Filter    : Last {OB_MAX_AGE_HOURS}h only")
     print(f"  Alert Cooldown   : 4h per OB zone")
     print("=" * 60)
 
     send_telegram(
-        "🚀 <b>Order Block Scanner LIVE (v3 — Fixed)</b>\n\n"
-        "🔧 <b>Fixes applied:</b>\n"
-        "  ✅ Mitigation logic corrected (return-to-zone)\n"
-        "  ✅ Opposing OB blocker (no buy under sell OB)\n"
-        "  ✅ RSI filter (no overbought buys / oversold sells)\n"
-        "  ✅ SL/TP auto-calculated in alerts\n"
-        "  ✅ Path-clear confirmation in message\n\n"
+        "🚀 <b>Order Block Scanner LIVE (v4)</b>\n\n"
+        "🔧 <b>All filters active:</b>\n"
+        "  ✅ Mitigation — price must return to zone\n"
+        "  ✅ Opposing OB blocker — no buy under sell OB\n"
+        "  ✅ RSI filter — no overbought buys / oversold sells\n"
+        "  ✅ Breakout Probability (Expo) — signal + bias must align\n"
+        "  ✅ SL/TP + 10x profit in every alert\n\n"
         "📊 Scanning: Top 500 MEXC Futures | 1H TF\n"
-        "🎯 Fewer alerts, much higher quality"
+        "🎯 Only highest-confidence setups will alert"
     )
 
     symbols: list[str] = []
@@ -462,6 +701,7 @@ def run():
 
                     obs = detect_order_blocks(candles)
                     rsi = calculate_rsi(candles)
+                    bp  = calc_breakout_probability(candles)   # Breakout Probability
 
                     for ob in obs:
                         ob_key = f"{symbol}_{ob['type']}_{ob['time']}"
@@ -478,7 +718,7 @@ def run():
                         if not is_touching(price, ob):
                             continue
 
-                        # ── 3. RSI filter (NEW) ──────────────────────────
+                        # ── 3. RSI filter ────────────────────────────────
                         if rsi >= 0:
                             if ob["type"] == "BUY"  and rsi > RSI_BUY_MAX:
                                 print(f"  ⚠ {symbol} BUY skipped — RSI {rsi} > {RSI_BUY_MAX}")
@@ -487,7 +727,7 @@ def run():
                                 print(f"  ⚠ {symbol} SELL skipped — RSI {rsi} < {RSI_SELL_MIN}")
                                 continue
 
-                        # ── 4. Opposing OB block check (NEW — main fix) ──
+                        # ── 4. Opposing OB block check ───────────────────
                         blocked, blocker_price = has_opposing_ob_in_path(
                             ob["type"], price, obs, candles
                         )
@@ -499,10 +739,26 @@ def run():
                             )
                             continue
 
+                        # ── 5. Breakout Probability alignment check ───────
+                        # Signal must AGREE with breakout bias.
+                        # If OB says BUY but breakout says BEARISH → skip.
+                        ob_needs_bias = "BULLISH" if ob["type"] == "BUY" else "BEARISH"
+                        if bp["bias"] != "NEUTRAL" and bp["bias"] != ob_needs_bias:
+                            coin = symbol.replace("_USDT", "")
+                            print(
+                                f"  📉 {coin} {ob['type']} skipped — "
+                                f"Breakout bias is {bp['bias']} "
+                                f"(Up:{bp['prob_up']}% Dn:{bp['prob_down']}%)"
+                            )
+                            continue
+
                         # ── All checks passed → send alert ───────────────
                         coin = symbol.replace("_USDT", "")
-                        print(f"  ⚡ {coin} | {ob['type']} OB @ {fmt_price(price)} | RSI {rsi}")
-                        if send_telegram(make_alert(symbol, ob, price, rsi)):
+                        print(
+                            f"  ⚡ {coin} | {ob['type']} OB @ {fmt_price(price)} "
+                            f"| RSI {rsi} | BP {bp['bias']} {bp['prob_up']}%↑"
+                        )
+                        if send_telegram(make_alert(symbol, ob, price, rsi, candles, bp)):
                             TOUCHED_ALERTS[ob_key]   = now
                             TOUCHED_ALERTS[coin_key] = now
                             alerts_sent += 1
