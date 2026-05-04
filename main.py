@@ -11,23 +11,31 @@ MEXC_BASE_URL       = "https://contract.mexc.com/api/v1"
 TIMEFRAME           = "Min60"
 CHECK_INTERVAL      = 60
 OB_MAX_AGE_HOURS    = 48
-ALERT_COOLDOWN        = 1 * 3600  # min 1 hour gap between alerts for same coin
-MAX_ALERTS_PER_DAY    = 4         # max 4 alerts per coin per UTC day
-MIN_VOLUME_USDT       = 5_000_000
-VOLUME_MULTIPLIER     = 1.5
-MIN_BODY_RATIO        = 0.4
+ALERT_COOLDOWN      = 1 * 3600       # 1h gap between alerts per coin
+MAX_ALERTS_PER_DAY  = 4
+MIN_VOLUME_USDT     = 5_000_000
+VOLUME_MULTIPLIER   = 1.5
+MIN_BODY_RATIO      = 0.4
 
-# ── NEW CONFIGS ───────────────────────────────
-OPPOSING_OB_BLOCK_PCT = 5.0   # if SELL OB is within 5% above price → block BUY signal
-MITIGATION_MOVE_PCT   = 1.5   # price must move 1.5% away from OB top/bottom
+# ── FILTERS v5 (TIGHTENED) ────────────────────
+OPPOSING_OB_BLOCK_PCT = 5.0
+MITIGATION_MOVE_PCT   = 2.0     # ⬆ was 1.5% — requires stronger impulse away from OB
 
-# RSI thresholds
 RSI_PERIOD            = 14
-RSI_BUY_MAX           = 65
-RSI_SELL_MIN          = 35
+RSI_BUY_MAX           = 55      # ⬇ was 65 — no buy when RSI is already high
+RSI_SELL_MIN          = 45      # ⬆ was 35 — no sell when RSI is already oversold
 
-TOUCHED_ALERTS:    dict = {}   # ob_key/coin_key → last alert unix timestamp
-DAILY_ALERT_COUNT: dict = {}   # coin → {"date": "YYYY-MM-DD", "count": N}
+# ── NEW v5 CONFIGS ────────────────────────────
+EMA_FAST              = 20      # Fast EMA — short-term trend
+EMA_SLOW              = 50      # Slow EMA — medium-term trend
+MIN_OB_RANGE_PCT      = 0.3     # OB must be at least 0.3% wide (avoids micro OBs)
+RETEST_VOL_RATIO_MAX  = 0.85    # retest candle vol must be ≤85% of OB candle vol
+                                 #  → weak volume on retest = sellers/buyers exhausted
+MIN_PROB_SCORE        = 60      # Only send alerts if score ≥ 60%
+CLOSE_INSIDE_OB       = True    # Require last candle to CLOSE inside OB (not just touch)
+
+TOUCHED_ALERTS:    dict = {}
+DAILY_ALERT_COUNT: dict = {}
 
 # ─────────────────────────────────────────────
 #  TELEGRAM
@@ -76,7 +84,8 @@ def get_top_symbols(limit: int = 500) -> list[str]:
 # ─────────────────────────────────────────────
 #  CANDLES
 # ─────────────────────────────────────────────
-def get_candles(symbol: str, limit: int = 120) -> list[dict]:
+def get_candles(symbol: str, limit: int = 150) -> list[dict]:
+    """Fetch candles — increased default to 150 for better EMA accuracy."""
     try:
         r    = requests.get(
             f"{MEXC_BASE_URL}/contract/kline/{symbol}",
@@ -120,29 +129,83 @@ def average_volume(candles: list[dict]) -> float:
     return sum(vols) / len(vols) if vols else 0
 
 # ─────────────────────────────────────────────
+#  EMA CALCULATION (NEW v5)
+# ─────────────────────────────────────────────
+def calculate_ema(candles: list[dict], period: int) -> list[float]:
+    """
+    Returns EMA values for each candle.
+    Returns empty list if not enough data.
+    """
+    closes = [c["close"] for c in candles]
+    if len(closes) < period:
+        return []
+
+    k      = 2 / (period + 1)
+    ema    = [sum(closes[:period]) / period]   # seed with SMA
+
+    for price in closes[period:]:
+        ema.append(price * k + ema[-1] * (1 - k))
+
+    # Pad front with None placeholders → same length as candles
+    pad = [None] * (period - 1)
+    return pad + ema  # type: ignore
+
+
+def get_trend(candles: list[dict]) -> str:
+    """
+    ✅ NEW v5 — EMA Trend Filter
+    Uses EMA20 vs EMA50 crossover + slope to determine trend.
+
+    Returns: "BULLISH", "BEARISH", or "NEUTRAL"
+
+    Rules:
+      BULLISH: EMA20 > EMA50  AND  last 3 EMA20 values trending UP
+      BEARISH: EMA20 < EMA50  AND  last 3 EMA20 values trending DOWN
+      NEUTRAL: anything else (choppy/ranging)
+    """
+    ema_fast = calculate_ema(candles, EMA_FAST)
+    ema_slow = calculate_ema(candles, EMA_SLOW)
+
+    if len(ema_fast) < 3 or len(ema_slow) < 3:
+        return "NEUTRAL"
+
+    # Get last 3 valid fast EMA values
+    valid_fast = [v for v in ema_fast if v is not None]
+    valid_slow = [v for v in ema_slow if v is not None]
+
+    if len(valid_fast) < 3 or len(valid_slow) < 1:
+        return "NEUTRAL"
+
+    fast_now  = valid_fast[-1]
+    fast_prev = valid_fast[-2]
+    fast_pp   = valid_fast[-3]
+    slow_now  = valid_slow[-1]
+
+    ema_rising  = fast_now > fast_prev > fast_pp
+    ema_falling = fast_now < fast_prev < fast_pp
+
+    if fast_now > slow_now and ema_rising:
+        return "BULLISH"
+    elif fast_now < slow_now and ema_falling:
+        return "BEARISH"
+    else:
+        return "NEUTRAL"
+
+
+# ─────────────────────────────────────────────
 #  ALERT RATE LIMITER
 # ─────────────────────────────────────────────
 def can_alert(coin: str, now: float) -> tuple[bool, str]:
-    """
-    Two-layer check:
-      1. Hourly cooldown  — min 1h between any alert for this coin
-      2. Daily cap        — max MAX_ALERTS_PER_DAY alerts per UTC day
-
-    Returns (allowed: bool, reason: str)
-    """
     coin_key  = f"{coin}_last_alert"
     today_str = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d")
 
-    # ── 1. Hourly cooldown ───────────────────
     last_sent = TOUCHED_ALERTS.get(coin_key, 0)
     if now - last_sent < ALERT_COOLDOWN:
         wait_min = int((ALERT_COOLDOWN - (now - last_sent)) / 60)
         return False, f"cooldown ({wait_min}m left)"
 
-    # ── 2. Daily cap ─────────────────────────
     entry = DAILY_ALERT_COUNT.get(coin, {"date": "", "count": 0})
     if entry["date"] != today_str:
-        # New UTC day — reset counter
         entry = {"date": today_str, "count": 0}
         DAILY_ALERT_COUNT[coin] = entry
 
@@ -153,11 +216,10 @@ def can_alert(coin: str, now: float) -> tuple[bool, str]:
 
 
 def record_alert(coin: str, ob_key: str, now: float) -> None:
-    """Mark alert as sent — update both cooldown and daily counter."""
     coin_key  = f"{coin}_last_alert"
     today_str = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d")
 
-    TOUCHED_ALERTS[ob_key]  = now
+    TOUCHED_ALERTS[ob_key]   = now
     TOUCHED_ALERTS[coin_key] = now
 
     entry = DAILY_ALERT_COUNT.get(coin, {"date": today_str, "count": 0})
@@ -168,13 +230,9 @@ def record_alert(coin: str, ob_key: str, now: float) -> None:
 
 
 # ─────────────────────────────────────────────
-#  RSI CALCULATION  (NEW)
+#  RSI
 # ─────────────────────────────────────────────
 def calculate_rsi(candles: list[dict], period: int = RSI_PERIOD) -> float:
-    """
-    Standard Wilder RSI using closing prices.
-    Returns value 0–100, or -1 if not enough data.
-    """
     closes = [c["close"] for c in candles]
     if len(closes) < period + 1:
         return -1
@@ -188,7 +246,6 @@ def calculate_rsi(candles: list[dict], period: int = RSI_PERIOD) -> float:
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
-    # Wilder smoothing for remaining candles
     for i in range(period + 1, len(closes)):
         diff     = closes[i] - closes[i - 1]
         avg_gain = (avg_gain * (period - 1) + max(diff, 0))  / period
@@ -196,18 +253,13 @@ def calculate_rsi(candles: list[dict], period: int = RSI_PERIOD) -> float:
 
     if avg_loss == 0:
         return 100.0
-    rs  = avg_gain / avg_loss
+    rs = avg_gain / avg_loss
     return round(100 - (100 / (1 + rs)), 2)
 
 # ─────────────────────────────────────────────
 #  ORDER BLOCK DETECTION
 # ─────────────────────────────────────────────
 def detect_order_blocks(candles: list[dict]) -> list[dict]:
-    """
-    BUY OB  : bearish OB → bullish trigger → strong bullish confirmation
-    SELL OB : bullish OB → bearish trigger → strong bearish confirmation
-    + high-volume & body-quality filters
-    """
     if len(candles) < 10:
         return []
 
@@ -215,9 +267,9 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
     obs     = []
 
     for i in range(2, len(candles) - 1):
-        ob_c  = candles[i - 1]
-        trig  = candles[i]
-        conf  = candles[i + 1]
+        ob_c = candles[i - 1]
+        trig = candles[i]
+        conf = candles[i + 1]
 
         if not is_fresh(ob_c["time"]):
             continue
@@ -225,6 +277,12 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
         ob_range = ob_c["high"] - ob_c["low"]
         if ob_range == 0:
             continue
+
+        # ── NEW v5: minimum OB width filter ──
+        ob_range_pct = (ob_range / ob_c["close"]) * 100
+        if ob_range_pct < MIN_OB_RANGE_PCT:
+            continue
+
         ob_body = abs(ob_c["close"] - ob_c["open"])
         if ob_body / ob_range < MIN_BODY_RATIO:
             continue
@@ -241,6 +299,7 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
                 "top":    ob_c["high"],
                 "bottom": ob_c["low"],
                 "time":   ob_c["time"],
+                "vol":    ob_c["vol"],
             })
 
         # SELL OB
@@ -252,30 +311,20 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
                 "top":    ob_c["high"],
                 "bottom": ob_c["low"],
                 "time":   ob_c["time"],
+                "vol":    ob_c["vol"],
             })
 
     return obs
 
 # ─────────────────────────────────────────────
-#  MITIGATION CHECK  (FIXED)
+#  MITIGATION CHECK
 # ─────────────────────────────────────────────
 def was_mitigated(ob: dict, candles: list[dict]) -> bool:
-    """
-    ✅ FIXED LOGIC — Old code was checking if price MOVED AWAY from OB,
-       which was already guaranteed by detection. Correct logic:
-
-    BUY OB  → After forming, price first moves UP (away), then comes BACK DOWN
-               to touch/enter the OB zone.  That return touch = mitigation.
-
-    SELL OB → After forming, price first moves DOWN (away), then comes BACK UP
-               to touch/enter the OB zone.  That return touch = mitigation.
-    """
     post = [c for c in candles if c["time"] > ob["time"]]
     if len(post) < 2:
         return False
 
     if ob["type"] == "BUY":
-        # Step 1: Confirm price moved UP away from OB (at least MITIGATION_MOVE_PCT)
         threshold_up = ob["top"] * (1 + MITIGATION_MOVE_PCT / 100)
         moved_up     = False
         moved_up_idx = -1
@@ -284,18 +333,14 @@ def was_mitigated(ob: dict, candles: list[dict]) -> bool:
                 moved_up     = True
                 moved_up_idx = idx
                 break
-
         if not moved_up:
-            return False   # impulse never happened — not a valid OB retest
-
-        # Step 2: After moving up, did price return DOWN into OB zone?
+            return False
         for c in post[moved_up_idx + 1:]:
-            if c["low"] <= ob["top"]:   # price touched back into OB zone
+            if c["low"] <= ob["top"]:
                 return True
         return False
 
-    else:  # SELL OB
-        # Step 1: Confirm price moved DOWN away from OB
+    else:
         threshold_dn = ob["bottom"] * (1 - MITIGATION_MOVE_PCT / 100)
         moved_dn     = False
         moved_dn_idx = -1
@@ -304,18 +349,57 @@ def was_mitigated(ob: dict, candles: list[dict]) -> bool:
                 moved_dn     = True
                 moved_dn_idx = idx
                 break
-
         if not moved_dn:
             return False
-
-        # Step 2: After moving down, did price return UP into OB zone?
         for c in post[moved_dn_idx + 1:]:
-            if c["high"] >= ob["bottom"]:  # price touched back into OB zone
+            if c["high"] >= ob["bottom"]:
                 return True
         return False
 
 # ─────────────────────────────────────────────
-#  OPPOSING OB BLOCK CHECK  (NEW — main fix)
+#  RETEST VOLUME CHECK (NEW v5)
+# ─────────────────────────────────────────────
+def is_retest_volume_weak(ob: dict, candles: list[dict], price: float) -> bool:
+    """
+    ✅ NEW v5 — Checks if the volume on RETEST is weaker than the OB candle.
+
+    Logic:
+      When price comes BACK to an OB zone, it should do so on LOW volume.
+      High volume on retest = strong conviction to break through = bad signal.
+      Low volume on retest  = weak push, likely to reverse    = good signal.
+
+    We check the last 3 candles that touched the OB zone and compare their
+    average volume against the original OB candle's volume.
+
+    Returns True if retest volume is weak (GOOD for trade).
+    """
+    ob_vol = ob.get("vol", 0)
+    if ob_vol == 0:
+        return True  # can't compare, skip check
+
+    # Find recent candles that touched the OB zone
+    retest_candles = []
+    for c in candles[-10:]:     # look at last 10 candles
+        if c["time"] <= ob["time"]:
+            continue
+        if ob["type"] == "BUY":
+            if c["low"] <= ob["top"]:
+                retest_candles.append(c)
+        else:
+            if c["high"] >= ob["bottom"]:
+                retest_candles.append(c)
+
+    if not retest_candles:
+        return True  # no retest candles found, allow
+
+    avg_retest_vol = sum(c["vol"] for c in retest_candles[-3:]) / len(retest_candles[-3:])
+    ratio          = avg_retest_vol / ob_vol
+
+    return ratio <= RETEST_VOL_RATIO_MAX
+
+
+# ─────────────────────────────────────────────
+#  OPPOSING OB BLOCK CHECK
 # ─────────────────────────────────────────────
 def has_opposing_ob_in_path(
     signal_type: str,
@@ -323,50 +407,51 @@ def has_opposing_ob_in_path(
     obs: list[dict],
     candles: list[dict],
 ) -> tuple[bool, float | None]:
-    """
-    ✅ MAIN FIX — This was the root cause of wrong signals.
-
-    For a BUY signal:
-        Check if there is any ACTIVE (mitigated) SELL OB sitting
-        between current price and OPPOSING_OB_BLOCK_PCT% above it.
-        If yes → price will likely get rejected there → SKIP BUY signal.
-
-    For a SELL signal:
-        Check if there is any ACTIVE (mitigated) BUY OB sitting
-        between OPPOSING_OB_BLOCK_PCT% below price and current price.
-        If yes → price will likely bounce there → SKIP SELL signal.
-
-    Returns (blocked: bool, blocking_ob_price: float | None)
-    """
     if signal_type == "BUY":
         upper_limit = price * (1 + OPPOSING_OB_BLOCK_PCT / 100)
         for ob in obs:
             if ob["type"] != "SELL":
                 continue
-            # Is this SELL OB sitting between price and upper_limit?
             if price < ob["bottom"] <= upper_limit:
                 if was_mitigated(ob, candles):
                     return True, ob["bottom"]
         return False, None
 
-    else:  # SELL
+    else:
         lower_limit = price * (1 - OPPOSING_OB_BLOCK_PCT / 100)
         for ob in obs:
             if ob["type"] != "BUY":
                 continue
-            # Is this BUY OB sitting between lower_limit and price?
             if lower_limit <= ob["top"] < price:
                 if was_mitigated(ob, candles):
                     return True, ob["top"]
         return False, None
 
 # ─────────────────────────────────────────────
-#  TOUCH CHECK
+#  TOUCH CHECK (IMPROVED v5)
 # ─────────────────────────────────────────────
-def is_touching(price: float, ob: dict) -> bool:
+def is_touching(price: float, ob: dict, last_candle: dict) -> bool:
+    """
+    ✅ IMPROVED v5 — Two modes:
+
+    If CLOSE_INSIDE_OB = True (stricter):
+      Require the last CLOSED candle's body to be inside or overlapping OB.
+      This avoids wicks that just touch OB and bounce before close.
+
+    If CLOSE_INSIDE_OB = False (looser, like v4):
+      Just check if live price is in the OB zone (with 10% tolerance).
+    """
     spread = ob["top"] - ob["bottom"]
     tol    = spread * 0.10
-    return (ob["bottom"] - tol) <= price <= (ob["top"] + tol)
+
+    if CLOSE_INSIDE_OB:
+        # Check if the candle body overlaps with OB zone
+        body_high = max(last_candle["open"], last_candle["close"])
+        body_low  = min(last_candle["open"], last_candle["close"])
+        # Body must touch or enter OB zone
+        return body_low <= (ob["top"] + tol) and body_high >= (ob["bottom"] - tol)
+    else:
+        return (ob["bottom"] - tol) <= price <= (ob["top"] + tol)
 
 # ─────────────────────────────────────────────
 #  LIVE PRICE MAP
@@ -388,10 +473,6 @@ def get_price_map() -> dict[str, float]:
 #  SUGGEST SL / TP
 # ─────────────────────────────────────────────
 def suggest_sl_tp(ob: dict, price: float) -> tuple[float, float]:
-    """
-    BUY  → SL just below OB bottom (1% buffer), TP = 2× risk above entry
-    SELL → SL just above OB top   (1% buffer), TP = 2× risk below entry
-    """
     if ob["type"] == "BUY":
         sl   = ob["bottom"] * 0.99
         risk = price - sl
@@ -403,88 +484,101 @@ def suggest_sl_tp(ob: dict, price: float) -> tuple[float, float]:
     return round(sl, 6), round(tp, 6)
 
 # ─────────────────────────────────────────────
-#  PROBABILITY SCORE
+#  PROBABILITY SCORE (IMPROVED v5)
 # ─────────────────────────────────────────────
 def calc_probability_score(
-    ob: dict,
-    rsi: float,
-    candles: list[dict],
+    ob:          dict,
+    rsi:         float,
+    candles:     list[dict],
+    trend:       str,
+    retest_weak: bool,
 ) -> float:
     """
-    Score 0–100 based on:
-      - RSI confluence   (30 pts)
-      - OB age           (25 pts) — fresher = better
-      - Volume strength  (25 pts) — how much above avg
-      - Body quality     (20 pts) — body/range ratio
+    Score 0–100:
+      RSI confluence     20 pts  (reduced — trend more important)
+      OB age             20 pts
+      Volume strength    20 pts
+      Body quality       15 pts
+      Trend alignment    15 pts  (NEW v5)
+      Retest volume weak 10 pts  (NEW v5)
     """
-    score = 0.0
+    score  = 0.0
     is_buy = ob["type"] == "BUY"
 
-    # ── RSI (30 pts) ─────────────────────────
+    # ── RSI (20 pts) ──────────────────────────
     if rsi >= 0:
         if is_buy:
-            # Best score around 30–50 (room to go up)
-            if 25 <= rsi <= 50:
-                score += 30
-            elif 50 < rsi <= 60:
-                score += 20
+            if 25 <= rsi <= 45:
+                score += 20    # ideal: room to go up, not oversold
+            elif 45 < rsi <= 55:
+                score += 12
             elif rsi < 25:
-                score += 15   # oversold but possible reversal
+                score += 8     # oversold bounce possible
             else:
-                score += 5
+                score += 2
         else:
-            # Best score around 50–70 (room to go down)
-            if 50 <= rsi <= 75:
-                score += 30
-            elif 40 <= rsi < 50:
+            if 55 <= rsi <= 75:
                 score += 20
+            elif 45 <= rsi < 55:
+                score += 12
             elif rsi > 75:
-                score += 15
+                score += 8
             else:
-                score += 5
+                score += 2
 
-    # ── OB Age (25 pts) ──────────────────────
+    # ── OB Age (20 pts) ───────────────────────
     age_h = (time.time() - ob["time"]) / 3600
     if age_h <= 6:
-        score += 25
-    elif age_h <= 12:
         score += 20
+    elif age_h <= 12:
+        score += 16
     elif age_h <= 24:
-        score += 15
+        score += 10
     elif age_h <= 36:
-        score += 8
+        score += 5
     else:
-        score += 3
+        score += 2
 
-    # ── Volume strength (25 pts) ─────────────
-    avg_vol = average_volume(candles)
-    ob_candle = next(
-        (c for c in candles if c["time"] == ob["time"]), None
-    )
+    # ── Volume strength (20 pts) ──────────────
+    avg_vol   = average_volume(candles)
+    ob_candle = next((c for c in candles if c["time"] == ob["time"]), None)
     if ob_candle and avg_vol > 0:
         vol_ratio = ob_candle["vol"] / avg_vol
         if vol_ratio >= 3.0:
-            score += 25
-        elif vol_ratio >= 2.0:
             score += 20
+        elif vol_ratio >= 2.0:
+            score += 15
         elif vol_ratio >= 1.5:
-            score += 14
+            score += 10
         else:
-            score += 6
+            score += 5
 
-    # ── Body quality (20 pts) ────────────────
+    # ── Body quality (15 pts) ─────────────────
     if ob_candle:
         ob_range = ob_candle["high"] - ob_candle["low"]
         if ob_range > 0:
             body_ratio = abs(ob_candle["close"] - ob_candle["open"]) / ob_range
             if body_ratio >= 0.8:
-                score += 20
-            elif body_ratio >= 0.65:
                 score += 15
+            elif body_ratio >= 0.65:
+                score += 11
             elif body_ratio >= 0.5:
-                score += 10
+                score += 7
             else:
-                score += 5
+                score += 3
+
+    # ── Trend alignment (15 pts) ── NEW v5 ────
+    ob_needs = "BULLISH" if is_buy else "BEARISH"
+    if trend == ob_needs:
+        score += 15
+    elif trend == "NEUTRAL":
+        score += 7
+    else:
+        score += 0    # trend opposes signal
+
+    # ── Retest volume weak (10 pts) ── NEW v5 ─
+    if retest_weak:
+        score += 10
 
     return round(min(score, 100.0), 1)
 
@@ -492,10 +586,6 @@ def calc_probability_score(
 #  10x LEVERAGE PROFIT CALC
 # ─────────────────────────────────────────────
 def calc_10x_profit(entry: float, tp: float, sl: float, is_buy: bool) -> dict:
-    """
-    Returns profit% and loss% at 10x leverage.
-    Formula: pnl% = (price_change / entry) * 100 * leverage
-    """
     leverage = 10
     if is_buy:
         profit_pct = ((tp - entry) / entry) * 100 * leverage
@@ -509,52 +599,24 @@ def calc_10x_profit(entry: float, tp: float, sl: float, is_buy: bool) -> dict:
     }
 
 # ─────────────────────────────────────────────
-#  BREAKOUT PROBABILITY  (Expo indicator — Pine Script translated)
+#  BREAKOUT PROBABILITY
 # ─────────────────────────────────────────────
 def calc_breakout_probability(candles: list[dict], perc: float = 1.0) -> dict:
-    """
-    Direct Python translation of "Breakout Probability (Expo)" by Zeiierman.
-
-    Logic:
-    ──────
-    For every closed bar i, look at bar i+1 (next bar):
-      • If bar i was GREEN (close > open):
-          - Did bar i+1's HIGH reach bar_i_high + step*level?  → green_hh[level]++
-          - Did bar i+1's LOW  reach bar_i_low  - step*level?  → green_ll[level]++
-      • If bar i was RED   (close < open):
-          - same tracking separately                            → red_hh/red_ll
-
-    Probability = count / total_green_bars  (or total_red_bars)
-
-    Bias for the CURRENT (last) candle:
-      • Last candle green → use green stats → BULLISH if prob_up > prob_down
-      • Last candle red   → use red stats   → BULLISH if prob_up > prob_down
-
-    Extra: also check level 1 (step*1) and level 2 (step*2) for "how strong"
-    the breakout probability is at higher levels.
-    """
     if len(candles) < 20:
         return {
-            "bias":        "NEUTRAL",
-            "prob_up":     0.0,
-            "prob_down":   0.0,
-            "prob_up_l1":  0.0,
-            "prob_dn_l1":  0.0,
-            "total_green": 0,
-            "total_red":   0,
+            "bias": "NEUTRAL", "prob_up": 0.0, "prob_down": 0.0,
+            "prob_up_l1": 0.0, "prob_dn_l1": 0.0,
+            "total_green": 0, "total_red": 0,
         }
 
     total_green = 0
     total_red   = 0
-
-    # Levels 0, 1, 2 counters  [green_hh, green_ll, red_hh, red_ll]
-    counts = [[0, 0, 0, 0] for _ in range(3)]
+    counts      = [[0, 0, 0, 0] for _ in range(3)]
 
     for i in range(len(candles) - 1):
-        cur  = candles[i]
-        nxt  = candles[i + 1]
-        step = cur["close"] * (perc / 100)
-
+        cur      = candles[i]
+        nxt      = candles[i + 1]
+        step     = cur["close"] * (perc / 100)
         is_green = cur["close"] > cur["open"]
         is_red   = cur["close"] < cur["open"]
 
@@ -563,13 +625,12 @@ def calc_breakout_probability(candles: list[dict], perc: float = 1.0) -> dict:
         elif is_red:
             total_red += 1
         else:
-            continue   # doji — skip
+            continue
 
         for lvl in range(3):
             x  = step * lvl
             hh = nxt["high"] >= cur["high"] + x
             ll = nxt["low"]  <= cur["low"]  - x
-
             if is_green:
                 if hh: counts[lvl][0] += 1
                 if ll: counts[lvl][1] += 1
@@ -577,72 +638,69 @@ def calc_breakout_probability(candles: list[dict], perc: float = 1.0) -> dict:
                 if hh: counts[lvl][2] += 1
                 if ll: counts[lvl][3] += 1
 
-    # ── Use the LAST candle to decide which stats to read ──
-    last        = candles[-1]
-    last_green  = last["close"] > last["open"]
+    last       = candles[-1]
+    last_green = last["close"] > last["open"]
 
     def pct(num, denom):
         return round((num / denom) * 100, 2) if denom > 0 else 0.0
 
     if last_green:
-        # After green candles historically
-        prob_up    = pct(counts[0][0], total_green)   # level 0 up
-        prob_down  = pct(counts[0][1], total_green)   # level 0 down
-        prob_up_l1 = pct(counts[1][0], total_green)   # level 1 up
-        prob_dn_l1 = pct(counts[1][1], total_green)   # level 1 down
+        prob_up    = pct(counts[0][0], total_green)
+        prob_down  = pct(counts[0][1], total_green)
+        prob_up_l1 = pct(counts[1][0], total_green)
+        prob_dn_l1 = pct(counts[1][1], total_green)
     else:
-        # After red candles historically
         prob_up    = pct(counts[0][2], total_red)
         prob_down  = pct(counts[0][3], total_red)
         prob_up_l1 = pct(counts[1][2], total_red)
         prob_dn_l1 = pct(counts[1][3], total_red)
 
     bias = "BULLISH" if prob_up >= prob_down else "BEARISH"
-
     return {
-        "bias":        bias,
-        "prob_up":     prob_up,
-        "prob_down":   prob_down,
-        "prob_up_l1":  prob_up_l1,   # at +1% level — stronger breakout probability
-        "prob_dn_l1":  prob_dn_l1,
-        "total_green": total_green,
-        "total_red":   total_red,
-        "last_green":  last_green,
+        "bias": bias, "prob_up": prob_up, "prob_down": prob_down,
+        "prob_up_l1": prob_up_l1, "prob_dn_l1": prob_dn_l1,
+        "total_green": total_green, "total_red": total_red,
+        "last_green": last_green,
     }
 
 # ─────────────────────────────────────────────
-#  ALERT MESSAGE
+#  ALERT MESSAGE (UPDATED v5)
 # ─────────────────────────────────────────────
 def make_alert(
-    symbol:   str,
-    ob:       dict,
-    price:    float,
-    rsi:      float,
-    candles:  list[dict],
-    bp:       dict,          # breakout probability dict
+    symbol:      str,
+    ob:          dict,
+    price:       float,
+    rsi:         float,
+    candles:     list[dict],
+    bp:          dict,
+    trend:       str,
+    retest_weak: bool,
 ) -> str:
-    coin      = symbol.replace("_USDT", "")
-    is_buy    = ob["type"] == "BUY"
-    signal    = "LONG 📈"    if is_buy else "SHORT 📉"
-    bias_str  = "🐂 BULLISH" if is_buy else "🐻 BEARISH"
-    tv_link   = make_tradingview_link(symbol)
-    ob_age    = round((time.time() - ob["time"]) / 3600, 1)
-    sl, tp    = suggest_sl_tp(ob, price)
-    prob      = calc_probability_score(ob, rsi, candles)
-    leverage  = calc_10x_profit(price, tp, sl, is_buy)
-    rsi_str   = f"{rsi:.2f}" if rsi >= 0 else "N/A"
+    coin     = symbol.replace("_USDT", "")
+    is_buy   = ob["type"] == "BUY"
+    signal   = "LONG 📈"    if is_buy else "SHORT 📉"
+    bias_str = "🐂 BULLISH" if is_buy else "🐻 BEARISH"
+    tv_link  = make_tradingview_link(symbol)
+    ob_age   = round((time.time() - ob["time"]) / 3600, 1)
+    sl, tp   = suggest_sl_tp(ob, price)
+    prob     = calc_probability_score(ob, rsi, candles, trend, retest_weak)
+    leverage = calc_10x_profit(price, tp, sl, is_buy)
+    rsi_str  = f"{rsi:.2f}" if rsi >= 0 else "N/A"
 
-    # ── Breakout probability display ─────────────
-    bp_bias       = bp.get("bias", "NEUTRAL")
-    bp_up         = bp.get("prob_up",    0.0)
-    bp_dn         = bp.get("prob_down",  0.0)
-    bp_up_l1      = bp.get("prob_up_l1", 0.0)
-    bp_dn_l1      = bp.get("prob_dn_l1", 0.0)
-    bp_emoji      = "🐂" if bp_bias == "BULLISH" else ("🐻" if bp_bias == "BEARISH" else "➖")
-    bp_confirm    = "✅" if bp_bias == ("BULLISH" if is_buy else "BEARISH") else "⚠️"
-    bp_agree_txt  = "Confirms signal" if bp_confirm == "✅" else "Diverges from signal"
+    bp_bias      = bp.get("bias", "NEUTRAL")
+    bp_up        = bp.get("prob_up", 0.0)
+    bp_dn        = bp.get("prob_down", 0.0)
+    bp_up_l1     = bp.get("prob_up_l1", 0.0)
+    bp_dn_l1     = bp.get("prob_dn_l1", 0.0)
+    bp_emoji     = "🐂" if bp_bias == "BULLISH" else ("🐻" if bp_bias == "BEARISH" else "➖")
+    bp_confirm   = "✅" if bp_bias == ("BULLISH" if is_buy else "BEARISH") else "⚠️"
+    bp_agree_txt = "Confirms signal" if bp_confirm == "✅" else "Diverges from signal"
 
-    # ── Quality label ────────────────────────────
+    trend_emoji = "🐂" if trend == "BULLISH" else ("🐻" if trend == "BEARISH" else "➖")
+    trend_match = "✅" if (trend == "BULLISH" and is_buy) or (trend == "BEARISH" and not is_buy) else ("⚠️" if trend == "NEUTRAL" else "❌")
+
+    retest_str = "✅ Weak (good)" if retest_weak else "⚠️ Strong (caution)"
+
     if prob >= 75:
         quality = "🔥 HIGH-QUALITY OB SIGNAL"
     elif prob >= 60:
@@ -660,11 +718,17 @@ def make_alert(
         f"💵 <b>Current Price:</b> {fmt_price(price)}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📉 <b>RSI (14):</b> {rsi_str}\n"
-        f"🎯 <b>OB Probability Score:</b> {prob}%\n"
+        f"🎯 <b>Probability Score:</b> {prob}%\n"
         f"🕐 <b>OB Age:</b> {ob_age}h ago\n"
         f"✅ <b>Candle Confirmed:</b> Yes (closed candle)\n"
         f"✅ <b>Mitigation:</b> Confirmed\n"
         f"✅ <b>Path Clear:</b> No opposing OB blocking\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>Trend Analysis (EMA20/50):</b>\n"
+        f"   {trend_emoji} <b>Trend:</b> {trend}\n"
+        f"   {trend_match} <b>Aligned with signal</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔊 <b>Retest Volume:</b> {retest_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>Breakout Probability (1H):</b>\n"
         f"   {bp_emoji} <b>Bias:</b> {bp_bias}\n"
@@ -691,28 +755,33 @@ def make_alert(
 # ─────────────────────────────────────────────
 def run():
     print("=" * 60)
-    print("  MEXC 1H Order Block Scanner  |  Top 500 Coins  (v4)")
+    print("  MEXC 1H Order Block Scanner  |  Top 500 Coins  (v5)")
     print(f"  Volume Filter    : >5M USDT 24h")
     print(f"  OB Vol Filter    : {VOLUME_MULTIPLIER}x avg candle volume")
     print(f"  Body Filter      : ≥{int(MIN_BODY_RATIO*100)}% body/range ratio")
-    print(f"  Mitigation       : FIXED — price must RETURN to zone")
+    print(f"  Min OB Width     : ≥{MIN_OB_RANGE_PCT}% of price")           # NEW
+    print(f"  Mitigation       : price must move {MITIGATION_MOVE_PCT}% AWAY then return")
+    print(f"  Touch Filter     : candle BODY must close inside OB")        # NEW
     print(f"  Opposing OB Blk  : Block if opposing OB within {OPPOSING_OB_BLOCK_PCT}%")
     print(f"  RSI Filter       : BUY ≤{RSI_BUY_MAX} | SELL ≥{RSI_SELL_MIN}")
-    print(f"  Breakout Prob    : OB signal must align with breakout bias")
+    print(f"  EMA Trend Filter : EMA{EMA_FAST}/EMA{EMA_SLOW} alignment required")  # NEW
+    print(f"  Retest Volume    : Retest vol must be ≤{int(RETEST_VOL_RATIO_MAX*100)}% of OB vol") # NEW
+    print(f"  Min Prob Score   : ≥{MIN_PROB_SCORE}%")                     # NEW
     print(f"  OB Age Filter    : Last {OB_MAX_AGE_HOURS}h only")
-    print(f"  Alert Cooldown   : 4h per OB zone")
+    print(f"  Alert Cooldown   : 1h per coin")
     print("=" * 60)
 
     send_telegram(
-        "🚀 <b>Order Block Scanner LIVE (v4)</b>\n\n"
-        "🔧 <b>All filters active:</b>\n"
-        "  ✅ Mitigation — price must return to zone\n"
-        "  ✅ Opposing OB blocker — no buy under sell OB\n"
-        "  ✅ RSI filter — no overbought buys / oversold sells\n"
-        "  ✅ Breakout Probability (Expo) — signal + bias must align\n"
-        "  ✅ SL/TP + 10x profit in every alert\n\n"
+        "🚀 <b>Order Block Scanner LIVE (v5)</b>\n\n"
+        "🔧 <b>New filters in v5:</b>\n"
+        "  ✅ EMA20/50 trend filter — signal must match trend\n"
+        "  ✅ Retest volume check — weak vol on OB touch = better signal\n"
+        "  ✅ Candle body must CLOSE inside OB (not just wick touch)\n"
+        "  ✅ Min OB width 0.3% — removes micro/noise OBs\n"
+        "  ✅ Tighter RSI: BUY ≤55 | SELL ≥45\n"
+        "  ✅ Min probability score ≥60% to alert\n\n"
         "📊 Scanning: Top 500 MEXC Futures | 1H TF\n"
-        "🎯 Only highest-confidence setups will alert"
+        "🎯 Stricter = fewer but higher quality alerts"
     )
 
     symbols: list[str] = []
@@ -739,42 +808,42 @@ def run():
 
                     coin = symbol.replace("_USDT", "")
 
-                    # ── Per-coin rate limit (1h cooldown + 4/day cap) ──
                     allowed, reason = can_alert(coin, now)
                     if not allowed:
                         continue
 
-                    candles = get_candles(symbol, 120)
-                    if not candles or len(candles) < 20:
+                    candles = get_candles(symbol, 150)
+                    if not candles or len(candles) < 30:
                         continue
 
-                    obs = detect_order_blocks(candles)
-                    rsi = calculate_rsi(candles)
-                    bp  = calc_breakout_probability(candles)   # Breakout Probability
+                    obs   = detect_order_blocks(candles)
+                    rsi   = calculate_rsi(candles)
+                    bp    = calc_breakout_probability(candles)
+                    trend = get_trend(candles)          # NEW v5
+                    last_candle = candles[-1]           # for body close check
 
                     for ob in obs:
                         ob_key = f"{symbol}_{ob['type']}_{ob['time']}"
 
-                        # per-OB dedup (don't re-alert same OB within cooldown)
                         if ob_key in TOUCHED_ALERTS:
                             if now - TOUCHED_ALERTS[ob_key] < ALERT_COOLDOWN:
                                 continue
 
-                        # ── 1. Mitigation check (FIXED) ──────────────────
+                        # ── 1. Mitigation check ──────────────────────────
                         if not was_mitigated(ob, candles):
                             continue
 
-                        # ── 2. Touch check ───────────────────────────────
-                        if not is_touching(price, ob):
+                        # ── 2. Touch check (body close inside OB) ────────
+                        if not is_touching(price, ob, last_candle):
                             continue
 
                         # ── 3. RSI filter ────────────────────────────────
                         if rsi >= 0:
                             if ob["type"] == "BUY"  and rsi > RSI_BUY_MAX:
-                                print(f"  ⚠ {symbol} BUY skipped — RSI {rsi} > {RSI_BUY_MAX}")
+                                print(f"  ⚠ {coin} BUY skipped — RSI {rsi} > {RSI_BUY_MAX}")
                                 continue
                             if ob["type"] == "SELL" and rsi < RSI_SELL_MIN:
-                                print(f"  ⚠ {symbol} SELL skipped — RSI {rsi} < {RSI_SELL_MIN}")
+                                print(f"  ⚠ {coin} SELL skipped — RSI {rsi} < {RSI_SELL_MIN}")
                                 continue
 
                         # ── 4. Opposing OB block check ───────────────────
@@ -782,36 +851,42 @@ def run():
                             ob["type"], price, obs, candles
                         )
                         if blocked:
-                            coin = symbol.replace("_USDT", "")
-                            print(
-                                f"  🚫 {coin} {ob['type']} BLOCKED — "
-                                f"opposing OB at {fmt_price(blocker_price)}"
-                            )
+                            print(f"  🚫 {coin} {ob['type']} BLOCKED — opposing OB at {fmt_price(blocker_price)}")
                             continue
 
-                        # ── 5. Breakout Probability alignment check ───────
-                        # Signal must AGREE with breakout bias.
-                        # If OB says BUY but breakout says BEARISH → skip.
+                        # ── 5. Breakout probability alignment ─────────────
                         ob_needs_bias = "BULLISH" if ob["type"] == "BUY" else "BEARISH"
                         if bp["bias"] != "NEUTRAL" and bp["bias"] != ob_needs_bias:
-                            coin = symbol.replace("_USDT", "")
-                            print(
-                                f"  📉 {coin} {ob['type']} skipped — "
-                                f"Breakout bias is {bp['bias']} "
-                                f"(Up:{bp['prob_up']}% Dn:{bp['prob_down']}%)"
-                            )
+                            print(f"  📉 {coin} {ob['type']} skipped — BP bias {bp['bias']}")
                             continue
 
-                        # ── All checks passed → send alert ───────────────
+                        # ── 6. EMA Trend filter (NEW v5) ──────────────────
+                        # Allow NEUTRAL trend but BLOCK opposing trend
+                        ob_needs_trend = "BULLISH" if ob["type"] == "BUY" else "BEARISH"
+                        if trend != "NEUTRAL" and trend != ob_needs_trend:
+                            print(f"  📊 {coin} {ob['type']} skipped — EMA trend is {trend}")
+                            continue
+
+                        # ── 7. Retest volume check (NEW v5) ──────────────
+                        retest_weak = is_retest_volume_weak(ob, candles, price)
+                        # Not a hard block — but scored lower if volume is strong
+
+                        # ── 8. Minimum probability score (NEW v5) ─────────
+                        prob = calc_probability_score(ob, rsi, candles, trend, retest_weak)
+                        if prob < MIN_PROB_SCORE:
+                            print(f"  📉 {coin} {ob['type']} skipped — prob score {prob}% < {MIN_PROB_SCORE}%")
+                            continue
+
+                        # ── All checks passed → send alert ────────────────
                         print(
                             f"  ⚡ {coin} | {ob['type']} OB @ {fmt_price(price)} "
-                            f"| RSI {rsi} | BP {bp['bias']} {bp['prob_up']}%↑"
+                            f"| RSI {rsi} | Trend {trend} | Prob {prob}%"
                         )
-                        if send_telegram(make_alert(symbol, ob, price, rsi, candles, bp)):
+                        if send_telegram(make_alert(symbol, ob, price, rsi, candles, bp, trend, retest_weak)):
                             record_alert(coin, ob_key, now)
                             alerts_sent += 1
                             daily = DAILY_ALERT_COUNT[coin]["count"]
-                            print(f"     ✅ Alert sent! [{daily}/{MAX_ALERTS_PER_DAY} today] Next in 1h")
+                            print(f"     ✅ Alert sent! [{daily}/{MAX_ALERTS_PER_DAY} today]")
                         time.sleep(1.5)
                         break
 
