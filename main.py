@@ -697,76 +697,20 @@ def make_alert(
 ) -> str:
     coin     = symbol.replace("_USDT", "")
     is_buy   = ob["type"] == "BUY"
-    signal   = "LONG 📈"    if is_buy else "SHORT 📉"
-    bias_str = "🐂 BULLISH" if is_buy else "🐻 BEARISH"
+    signal   = "LONG 📈" if is_buy else "SHORT 📉"
     tv_link  = make_tradingview_link(symbol)
-    ob_age   = round((time.time() - ob["time"]) / 3600, 1)
     sl, tp   = suggest_sl_tp(ob, price)
     prob     = calc_probability_score(ob, rsi, candles, trend, retest_weak)
     leverage = calc_10x_profit(price, tp, sl, is_buy)
-    rsi_str  = f"{rsi:.2f}" if rsi >= 0 else "N/A"
-
-    bp_bias      = bp.get("bias", "NEUTRAL")
-    bp_up        = bp.get("prob_up", 0.0)
-    bp_dn        = bp.get("prob_down", 0.0)
-    bp_up_l1     = bp.get("prob_up_l1", 0.0)
-    bp_dn_l1     = bp.get("prob_dn_l1", 0.0)
-    bp_emoji     = "🐂" if bp_bias == "BULLISH" else ("🐻" if bp_bias == "BEARISH" else "➖")
-    bp_confirm   = "✅" if bp_bias == ("BULLISH" if is_buy else "BEARISH") else "⚠️"
-    bp_agree_txt = "Confirms signal" if bp_confirm == "✅" else "Diverges from signal"
-
-    trend_emoji = "🐂" if trend == "BULLISH" else ("🐻" if trend == "BEARISH" else "➖")
-    trend_match = "✅" if (trend == "BULLISH" and is_buy) or (trend == "BEARISH" and not is_buy) else ("⚠️" if trend == "NEUTRAL" else "❌")
-
-    retest_str = "✅ Weak (good)" if retest_weak else "⚠️ Strong (caution)"
-
-    if prob >= 75:
-        quality = "🔥 HIGH-QUALITY OB SIGNAL"
-    elif prob >= 60:
-        quality = "⚡ MEDIUM-QUALITY OB SIGNAL"
-    else:
-        quality = "📊 OB SIGNAL"
 
     return (
-        f"<b>{quality}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📌 <b>Coin:</b> #{coin}/USDT\n"
-        f"⚡️ <b>Signal:</b> {signal}\n"
-        f"📊 <b>Bias:</b> {bias_str}\n"
-        f"💰 <b>Entry Zone:</b> {fmt_price(ob['bottom'])} — {fmt_price(ob['top'])}\n"
-        f"💵 <b>Current Price:</b> {fmt_price(price)}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📉 <b>RSI (14):</b> {rsi_str}\n"
-        f"🎯 <b>Probability Score:</b> {prob}%\n"
-        f"🕐 <b>OB Age:</b> {ob_age}h ago\n"
-        f"✅ <b>Candle Confirmed:</b> Yes (closed candle)\n"
-        f"✅ <b>Mitigation:</b> Confirmed\n"
-        f"✅ <b>Path Clear:</b> No fresh opposing OB blocking\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 <b>Trend Analysis (EMA20/50):</b>\n"
-        f"   {trend_emoji} <b>Trend:</b> {trend}\n"
-        f"   {trend_match} <b>Aligned with signal</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔊 <b>Retest Volume:</b> {retest_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Breakout Probability (1H):</b>\n"
-        f"   {bp_emoji} <b>Bias:</b> {bp_bias}\n"
-        f"   ⬆️  Up (L0): <b>{bp_up}%</b>  |  Up (L1+1%): <b>{bp_up_l1}%</b>\n"
-        f"   ⬇️  Dn (L0): <b>{bp_dn}%</b>  |  Dn (L1+1%): <b>{bp_dn_l1}%</b>\n"
-        f"   {bp_confirm} <b>{bp_agree_txt}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🛡️ <b>Suggested SL:</b> {fmt_price(sl)}\n"
-        f"🎯 <b>Suggested TP:</b> {fmt_price(tp)} (1:2 RR)\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"💹 <b>10x Leverage Potential:</b>\n"
-        f"   ✅ Profit if TP hit: <b>+{leverage['profit']}%</b>\n"
-        f"   ❌ Loss if SL hit:  <b>-{leverage['loss']}%</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f'📈 <a href="{tv_link}">View {coin}/USDT Chart ↗️</a>\n'
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<i>⚠️ Always use proper SL\n"
-        f"High leverage (10x-20x) = tight SL only\n"
-        f"Not Financial Advice | DYOR</i>"
+        f"<b>#{coin}/USDT — {signal}</b>\n"
+        f"💰 Entry: {fmt_price(ob['bottom'])} — {fmt_price(ob['top'])}\n"
+        f"🎯 Prob : {prob}%\n"
+        f"🛡 SL   : {fmt_price(sl)}\n"
+        f"🎯 TP   : {fmt_price(tp)}\n"
+        f"✅ TP hit: <b>+{leverage['profit']}%</b>  |  ❌ SL hit: <b>-{leverage['loss']}%</b>\n"
+        f'<a href="{tv_link}">Chart ↗️</a>'
     )
 
 # ─────────────────────────────────────────────
