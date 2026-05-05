@@ -19,20 +19,19 @@ MIN_BODY_RATIO      = 0.4
 
 # ── FILTERS v5 (TIGHTENED) ────────────────────
 OPPOSING_OB_BLOCK_PCT = 5.0
-MITIGATION_MOVE_PCT   = 2.0     # ⬆ was 1.5% — requires stronger impulse away from OB
+MITIGATION_MOVE_PCT   = 2.0
 
 RSI_PERIOD            = 14
-RSI_BUY_MAX           = 55      # ⬇ was 65 — no buy when RSI is already high
-RSI_SELL_MIN          = 45      # ⬆ was 35 — no sell when RSI is already oversold
+RSI_BUY_MAX           = 55
+RSI_SELL_MIN          = 45
 
-# ── NEW v5 CONFIGS ────────────────────────────
-EMA_FAST              = 20      # Fast EMA — short-term trend
-EMA_SLOW              = 50      # Slow EMA — medium-term trend
-MIN_OB_RANGE_PCT      = 0.3     # OB must be at least 0.3% wide (avoids micro OBs)
-RETEST_VOL_RATIO_MAX  = 0.85    # retest candle vol must be ≤85% of OB candle vol
-                                 #  → weak volume on retest = sellers/buyers exhausted
-MIN_PROB_SCORE        = 60      # Only send alerts if score ≥ 60%
-CLOSE_INSIDE_OB       = True    # Require last candle to CLOSE inside OB (not just touch)
+# ── v5 CONFIGS ────────────────────────────────
+EMA_FAST              = 20
+EMA_SLOW              = 50
+MIN_OB_RANGE_PCT      = 0.3
+RETEST_VOL_RATIO_MAX  = 0.85
+MIN_PROB_SCORE        = 60
+CLOSE_INSIDE_OB       = True
 
 TOUCHED_ALERTS:    dict = {}
 DAILY_ALERT_COUNT: dict = {}
@@ -85,7 +84,13 @@ def get_top_symbols(limit: int = 500) -> list[str]:
 #  CANDLES
 # ─────────────────────────────────────────────
 def get_candles(symbol: str, limit: int = 150) -> list[dict]:
-    """Fetch candles — increased default to 150 for better EMA accuracy."""
+    """
+    Fetch candles and SORT by time ascending.
+    ✅ FIX: MEXC may return candles in any order.
+    Sorting ensures OB detection, EMA, and mitigation logic
+    all run on correctly-ordered (oldest → newest) data.
+    Without this, signals can be completely reversed.
+    """
     try:
         r    = requests.get(
             f"{MEXC_BASE_URL}/contract/kline/{symbol}",
@@ -95,7 +100,7 @@ def get_candles(symbol: str, limit: int = 150) -> list[dict]:
         data = r.json()
         if data.get("success") and data.get("data"):
             raw = data["data"]
-            return [
+            candles = [
                 {
                     "time":  int(raw["time"][i]),
                     "open":  float(raw["open"][i]),
@@ -106,6 +111,9 @@ def get_candles(symbol: str, limit: int = 150) -> list[dict]:
                 }
                 for i in range(len(raw["time"]))
             ]
+            # ✅ CRITICAL FIX: Always sort oldest → newest
+            candles.sort(key=lambda x: x["time"])
+            return candles
     except Exception as e:
         print(f"[CANDLE ERROR] {symbol}: {e}")
     return []
@@ -129,39 +137,25 @@ def average_volume(candles: list[dict]) -> float:
     return sum(vols) / len(vols) if vols else 0
 
 # ─────────────────────────────────────────────
-#  EMA CALCULATION (NEW v5)
+#  EMA CALCULATION
 # ─────────────────────────────────────────────
 def calculate_ema(candles: list[dict], period: int) -> list[float]:
-    """
-    Returns EMA values for each candle.
-    Returns empty list if not enough data.
-    """
     closes = [c["close"] for c in candles]
     if len(closes) < period:
         return []
-
     k      = 2 / (period + 1)
-    ema    = [sum(closes[:period]) / period]   # seed with SMA
-
+    ema    = [sum(closes[:period]) / period]
     for price in closes[period:]:
         ema.append(price * k + ema[-1] * (1 - k))
-
-    # Pad front with None placeholders → same length as candles
     pad = [None] * (period - 1)
     return pad + ema  # type: ignore
 
 
 def get_trend(candles: list[dict]) -> str:
     """
-    ✅ NEW v5 — EMA Trend Filter
-    Uses EMA20 vs EMA50 crossover + slope to determine trend.
-
+    EMA20 vs EMA50 trend filter.
     Returns: "BULLISH", "BEARISH", or "NEUTRAL"
-
-    Rules:
-      BULLISH: EMA20 > EMA50  AND  last 3 EMA20 values trending UP
-      BEARISH: EMA20 < EMA50  AND  last 3 EMA20 values trending DOWN
-      NEUTRAL: anything else (choppy/ranging)
+    NOTE: candles must be sorted oldest→newest (guaranteed by get_candles fix).
     """
     ema_fast = calculate_ema(candles, EMA_FAST)
     ema_slow = calculate_ema(candles, EMA_SLOW)
@@ -169,7 +163,6 @@ def get_trend(candles: list[dict]) -> str:
     if len(ema_fast) < 3 or len(ema_slow) < 3:
         return "NEUTRAL"
 
-    # Get last 3 valid fast EMA values
     valid_fast = [v for v in ema_fast if v is not None]
     valid_slow = [v for v in ema_slow if v is not None]
 
@@ -260,6 +253,13 @@ def calculate_rsi(candles: list[dict], period: int = RSI_PERIOD) -> float:
 #  ORDER BLOCK DETECTION
 # ─────────────────────────────────────────────
 def detect_order_blocks(candles: list[dict]) -> list[dict]:
+    """
+    Detect BUY and SELL Order Blocks.
+    Candles must be sorted oldest→newest (guaranteed by get_candles fix).
+
+    BUY OB  = last bearish candle before a bullish impulse → expect LONG on retest
+    SELL OB = last bullish candle before a bearish impulse → expect SHORT on retest
+    """
     if len(candles) < 10:
         return []
 
@@ -267,9 +267,9 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
     obs     = []
 
     for i in range(2, len(candles) - 1):
-        ob_c = candles[i - 1]
-        trig = candles[i]
-        conf = candles[i + 1]
+        ob_c = candles[i - 1]   # OB candle (chronologically before trigger)
+        trig = candles[i]       # trigger candle (impulse)
+        conf = candles[i + 1]   # confirmation candle
 
         if not is_fresh(ob_c["time"]):
             continue
@@ -278,7 +278,6 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
         if ob_range == 0:
             continue
 
-        # ── NEW v5: minimum OB width filter ──
         ob_range_pct = (ob_range / ob_c["close"]) * 100
         if ob_range_pct < MIN_OB_RANGE_PCT:
             continue
@@ -290,7 +289,7 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
         if avg_vol > 0 and ob_c["vol"] < avg_vol * VOLUME_MULTIPLIER:
             continue
 
-        # BUY OB
+        # BUY OB: bearish OB candle → bullish trigger → bullish confirmation
         if (ob_c["close"] < ob_c["open"]
                 and trig["close"] > trig["open"]
                 and conf["close"] > trig["high"]):
@@ -302,7 +301,7 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
                 "vol":    ob_c["vol"],
             })
 
-        # SELL OB
+        # SELL OB: bullish OB candle → bearish trigger → bearish confirmation
         elif (ob_c["close"] > ob_c["open"]
                 and trig["close"] < trig["open"]
                 and conf["close"] < trig["low"]):
@@ -320,11 +319,24 @@ def detect_order_blocks(candles: list[dict]) -> list[dict]:
 #  MITIGATION CHECK
 # ─────────────────────────────────────────────
 def was_mitigated(ob: dict, candles: list[dict]) -> bool:
+    """
+    Returns True when price has RETURNED to the OB zone after the initial impulse.
+    This is the retest we want to trade.
+
+    BUY OB:
+      1. After OB, price moved UP ≥ MITIGATION_MOVE_PCT% (impulse away)
+      2. Then price came BACK DOWN into OB zone (retest = mitigation)
+
+    SELL OB:
+      1. After OB, price moved DOWN ≥ MITIGATION_MOVE_PCT% (impulse away)
+      2. Then price came BACK UP into OB zone (retest = mitigation)
+    """
     post = [c for c in candles if c["time"] > ob["time"]]
     if len(post) < 2:
         return False
 
     if ob["type"] == "BUY":
+        # Step 1: price must first rally 2%+ above OB top
         threshold_up = ob["top"] * (1 + MITIGATION_MOVE_PCT / 100)
         moved_up     = False
         moved_up_idx = -1
@@ -335,12 +347,14 @@ def was_mitigated(ob: dict, candles: list[dict]) -> bool:
                 break
         if not moved_up:
             return False
+        # Step 2: price must then pull back INTO the OB zone
         for c in post[moved_up_idx + 1:]:
             if c["low"] <= ob["top"]:
                 return True
         return False
 
-    else:
+    else:  # SELL OB
+        # Step 1: price must first drop 2%+ below OB bottom
         threshold_dn = ob["bottom"] * (1 - MITIGATION_MOVE_PCT / 100)
         moved_dn     = False
         moved_dn_idx = -1
@@ -351,35 +365,27 @@ def was_mitigated(ob: dict, candles: list[dict]) -> bool:
                 break
         if not moved_dn:
             return False
+        # Step 2: price must then bounce back INTO the OB zone
         for c in post[moved_dn_idx + 1:]:
             if c["high"] >= ob["bottom"]:
                 return True
         return False
 
 # ─────────────────────────────────────────────
-#  RETEST VOLUME CHECK (NEW v5)
+#  RETEST VOLUME CHECK
 # ─────────────────────────────────────────────
 def is_retest_volume_weak(ob: dict, candles: list[dict], price: float) -> bool:
     """
-    ✅ NEW v5 — Checks if the volume on RETEST is weaker than the OB candle.
-
-    Logic:
-      When price comes BACK to an OB zone, it should do so on LOW volume.
-      High volume on retest = strong conviction to break through = bad signal.
-      Low volume on retest  = weak push, likely to reverse    = good signal.
-
-    We check the last 3 candles that touched the OB zone and compare their
-    average volume against the original OB candle's volume.
-
-    Returns True if retest volume is weak (GOOD for trade).
+    Checks if the volume on RETEST is weaker than the OB candle.
+    Weak retest volume = sellers/buyers exhausted = good signal.
+    Strong retest volume = conviction to break through = bad signal.
     """
     ob_vol = ob.get("vol", 0)
     if ob_vol == 0:
-        return True  # can't compare, skip check
+        return True
 
-    # Find recent candles that touched the OB zone
     retest_candles = []
-    for c in candles[-10:]:     # look at last 10 candles
+    for c in candles[-10:]:
         if c["time"] <= ob["time"]:
             continue
         if ob["type"] == "BUY":
@@ -390,7 +396,7 @@ def is_retest_volume_weak(ob: dict, candles: list[dict], price: float) -> bool:
                 retest_candles.append(c)
 
     if not retest_candles:
-        return True  # no retest candles found, allow
+        return True
 
     avg_retest_vol = sum(c["vol"] for c in retest_candles[-3:]) / len(retest_candles[-3:])
     ratio          = avg_retest_vol / ob_vol
@@ -399,7 +405,7 @@ def is_retest_volume_weak(ob: dict, candles: list[dict], price: float) -> bool:
 
 
 # ─────────────────────────────────────────────
-#  OPPOSING OB BLOCK CHECK
+#  OPPOSING OB BLOCK CHECK  ← ✅ CRITICAL FIX
 # ─────────────────────────────────────────────
 def has_opposing_ob_in_path(
     signal_type: str,
@@ -407,48 +413,61 @@ def has_opposing_ob_in_path(
     obs: list[dict],
     candles: list[dict],
 ) -> tuple[bool, float | None]:
+    """
+    ✅ FIXED v5.1 — Previously had INVERTED logic.
+
+    OLD (WRONG): blocked signal only if opposing OB was MITIGATED (already consumed/weak)
+    NEW (CORRECT): blocks signal if opposing OB is FRESH (not yet mitigated = strong S/R)
+
+    Logic:
+      BUY  signal → block if there is a fresh (unmitigated) SELL OB above price.
+                    A fresh SELL OB above = overhead resistance that could stop the rally.
+      SELL signal → block if there is a fresh (unmitigated) BUY OB below price.
+                    A fresh BUY OB below = support that could stop the drop.
+
+    A mitigated opposing OB has already been retested and is considered consumed —
+    it no longer acts as strong S/R, so we do NOT block the signal for those.
+    """
     if signal_type == "BUY":
         upper_limit = price * (1 + OPPOSING_OB_BLOCK_PCT / 100)
         for ob in obs:
             if ob["type"] != "SELL":
                 continue
             if price < ob["bottom"] <= upper_limit:
-                if was_mitigated(ob, candles):
+                # ✅ FIXED: block if FRESH (not mitigated) = real resistance
+                if not was_mitigated(ob, candles):
                     return True, ob["bottom"]
         return False, None
 
-    else:
+    else:  # SELL signal
         lower_limit = price * (1 - OPPOSING_OB_BLOCK_PCT / 100)
         for ob in obs:
             if ob["type"] != "BUY":
                 continue
             if lower_limit <= ob["top"] < price:
-                if was_mitigated(ob, candles):
+                # ✅ FIXED: block if FRESH (not mitigated) = real support
+                if not was_mitigated(ob, candles):
                     return True, ob["top"]
         return False, None
 
 # ─────────────────────────────────────────────
-#  TOUCH CHECK (IMPROVED v5)
+#  TOUCH CHECK
 # ─────────────────────────────────────────────
 def is_touching(price: float, ob: dict, last_candle: dict) -> bool:
     """
-    ✅ IMPROVED v5 — Two modes:
+    If CLOSE_INSIDE_OB = True (strict mode):
+      Require the last candle's BODY to overlap the OB zone.
+      Avoids wick-touches that reverse before candle close.
 
-    If CLOSE_INSIDE_OB = True (stricter):
-      Require the last CLOSED candle's body to be inside or overlapping OB.
-      This avoids wicks that just touch OB and bounce before close.
-
-    If CLOSE_INSIDE_OB = False (looser, like v4):
+    If CLOSE_INSIDE_OB = False (loose mode):
       Just check if live price is in the OB zone (with 10% tolerance).
     """
     spread = ob["top"] - ob["bottom"]
     tol    = spread * 0.10
 
     if CLOSE_INSIDE_OB:
-        # Check if the candle body overlaps with OB zone
         body_high = max(last_candle["open"], last_candle["close"])
         body_low  = min(last_candle["open"], last_candle["close"])
-        # Body must touch or enter OB zone
         return body_low <= (ob["top"] + tol) and body_high >= (ob["bottom"] - tol)
     else:
         return (ob["bottom"] - tol) <= price <= (ob["top"] + tol)
@@ -484,7 +503,7 @@ def suggest_sl_tp(ob: dict, price: float) -> tuple[float, float]:
     return round(sl, 6), round(tp, 6)
 
 # ─────────────────────────────────────────────
-#  PROBABILITY SCORE (IMPROVED v5)
+#  PROBABILITY SCORE
 # ─────────────────────────────────────────────
 def calc_probability_score(
     ob:          dict,
@@ -495,12 +514,12 @@ def calc_probability_score(
 ) -> float:
     """
     Score 0–100:
-      RSI confluence     20 pts  (reduced — trend more important)
+      RSI confluence     20 pts
       OB age             20 pts
       Volume strength    20 pts
       Body quality       15 pts
-      Trend alignment    15 pts  (NEW v5)
-      Retest volume weak 10 pts  (NEW v5)
+      Trend alignment    15 pts
+      Retest volume weak 10 pts
     """
     score  = 0.0
     is_buy = ob["type"] == "BUY"
@@ -509,11 +528,11 @@ def calc_probability_score(
     if rsi >= 0:
         if is_buy:
             if 25 <= rsi <= 45:
-                score += 20    # ideal: room to go up, not oversold
+                score += 20
             elif 45 < rsi <= 55:
                 score += 12
             elif rsi < 25:
-                score += 8     # oversold bounce possible
+                score += 8
             else:
                 score += 2
         else:
@@ -567,16 +586,16 @@ def calc_probability_score(
             else:
                 score += 3
 
-    # ── Trend alignment (15 pts) ── NEW v5 ────
+    # ── Trend alignment (15 pts) ──────────────
     ob_needs = "BULLISH" if is_buy else "BEARISH"
     if trend == ob_needs:
         score += 15
     elif trend == "NEUTRAL":
         score += 7
     else:
-        score += 0    # trend opposes signal
+        score += 0
 
-    # ── Retest volume weak (10 pts) ── NEW v5 ─
+    # ── Retest volume weak (10 pts) ───────────
     if retest_weak:
         score += 10
 
@@ -664,7 +683,7 @@ def calc_breakout_probability(candles: list[dict], perc: float = 1.0) -> dict:
     }
 
 # ─────────────────────────────────────────────
-#  ALERT MESSAGE (UPDATED v5)
+#  ALERT MESSAGE
 # ─────────────────────────────────────────────
 def make_alert(
     symbol:      str,
@@ -722,7 +741,7 @@ def make_alert(
         f"🕐 <b>OB Age:</b> {ob_age}h ago\n"
         f"✅ <b>Candle Confirmed:</b> Yes (closed candle)\n"
         f"✅ <b>Mitigation:</b> Confirmed\n"
-        f"✅ <b>Path Clear:</b> No opposing OB blocking\n"
+        f"✅ <b>Path Clear:</b> No fresh opposing OB blocking\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📈 <b>Trend Analysis (EMA20/50):</b>\n"
         f"   {trend_emoji} <b>Trend:</b> {trend}\n"
@@ -755,31 +774,30 @@ def make_alert(
 # ─────────────────────────────────────────────
 def run():
     print("=" * 60)
-    print("  MEXC 1H Order Block Scanner  |  Top 500 Coins  (v5)")
+    print("  MEXC 1H Order Block Scanner  |  Top 500 Coins  (v5.1)")
     print(f"  Volume Filter    : >5M USDT 24h")
     print(f"  OB Vol Filter    : {VOLUME_MULTIPLIER}x avg candle volume")
     print(f"  Body Filter      : ≥{int(MIN_BODY_RATIO*100)}% body/range ratio")
-    print(f"  Min OB Width     : ≥{MIN_OB_RANGE_PCT}% of price")           # NEW
+    print(f"  Min OB Width     : ≥{MIN_OB_RANGE_PCT}% of price")
     print(f"  Mitigation       : price must move {MITIGATION_MOVE_PCT}% AWAY then return")
-    print(f"  Touch Filter     : candle BODY must close inside OB")        # NEW
-    print(f"  Opposing OB Blk  : Block if opposing OB within {OPPOSING_OB_BLOCK_PCT}%")
+    print(f"  Touch Filter     : candle BODY must close inside OB")
+    print(f"  Opposing OB Blk  : Block if FRESH (unmitigated) opposing OB within {OPPOSING_OB_BLOCK_PCT}%")
     print(f"  RSI Filter       : BUY ≤{RSI_BUY_MAX} | SELL ≥{RSI_SELL_MIN}")
-    print(f"  EMA Trend Filter : EMA{EMA_FAST}/EMA{EMA_SLOW} alignment required")  # NEW
-    print(f"  Retest Volume    : Retest vol must be ≤{int(RETEST_VOL_RATIO_MAX*100)}% of OB vol") # NEW
-    print(f"  Min Prob Score   : ≥{MIN_PROB_SCORE}%")                     # NEW
+    print(f"  EMA Trend Filter : EMA{EMA_FAST}/EMA{EMA_SLOW} alignment required")
+    print(f"  Retest Volume    : Retest vol must be ≤{int(RETEST_VOL_RATIO_MAX*100)}% of OB vol")
+    print(f"  Min Prob Score   : ≥{MIN_PROB_SCORE}%")
     print(f"  OB Age Filter    : Last {OB_MAX_AGE_HOURS}h only")
     print(f"  Alert Cooldown   : 1h per coin")
+    print(f"  ✅ FIX: Candles sorted oldest→newest (prevents reversed signals)")
+    print(f"  ✅ FIX: Opposing OB check uses FRESH OBs (not mitigated ones)")
     print("=" * 60)
 
     send_telegram(
-        "🚀 <b>Order Block Scanner LIVE (v5)</b>\n\n"
-        "🔧 <b>New filters in v5:</b>\n"
-        "  ✅ EMA20/50 trend filter — signal must match trend\n"
-        "  ✅ Retest volume check — weak vol on OB touch = better signal\n"
-        "  ✅ Candle body must CLOSE inside OB (not just wick touch)\n"
-        "  ✅ Min OB width 0.3% — removes micro/noise OBs\n"
-        "  ✅ Tighter RSI: BUY ≤55 | SELL ≥45\n"
-        "  ✅ Min probability score ≥60% to alert\n\n"
+        "🚀 <b>Order Block Scanner LIVE (v5.1 — FIXED)</b>\n\n"
+        "🔧 <b>Critical fixes in v5.1:</b>\n"
+        "  ✅ Candles now sorted oldest→newest (prevents flipped signals)\n"
+        "  ✅ Opposing OB check fixed — now blocks FRESH OBs in path\n"
+        "     (mitigated OBs no longer block valid signals)\n\n"
         "📊 Scanning: Top 500 MEXC Futures | 1H TF\n"
         "🎯 Stricter = fewer but higher quality alerts"
     )
@@ -812,15 +830,15 @@ def run():
                     if not allowed:
                         continue
 
-                    candles = get_candles(symbol, 150)
+                    candles = get_candles(symbol, 150)  # ✅ already sorted inside
                     if not candles or len(candles) < 30:
                         continue
 
-                    obs   = detect_order_blocks(candles)
-                    rsi   = calculate_rsi(candles)
-                    bp    = calc_breakout_probability(candles)
-                    trend = get_trend(candles)          # NEW v5
-                    last_candle = candles[-1]           # for body close check
+                    obs         = detect_order_blocks(candles)
+                    rsi         = calculate_rsi(candles)
+                    bp          = calc_breakout_probability(candles)
+                    trend       = get_trend(candles)
+                    last_candle = candles[-1]   # newest candle (after sort)
 
                     for ob in obs:
                         ob_key = f"{symbol}_{ob['type']}_{ob['time']}"
@@ -846,12 +864,12 @@ def run():
                                 print(f"  ⚠ {coin} SELL skipped — RSI {rsi} < {RSI_SELL_MIN}")
                                 continue
 
-                        # ── 4. Opposing OB block check ───────────────────
+                        # ── 4. Opposing OB block check (FIXED) ───────────
                         blocked, blocker_price = has_opposing_ob_in_path(
                             ob["type"], price, obs, candles
                         )
                         if blocked:
-                            print(f"  🚫 {coin} {ob['type']} BLOCKED — opposing OB at {fmt_price(blocker_price)}")
+                            print(f"  🚫 {coin} {ob['type']} BLOCKED — fresh opposing OB at {fmt_price(blocker_price)}")
                             continue
 
                         # ── 5. Breakout probability alignment ─────────────
@@ -860,18 +878,16 @@ def run():
                             print(f"  📉 {coin} {ob['type']} skipped — BP bias {bp['bias']}")
                             continue
 
-                        # ── 6. EMA Trend filter (NEW v5) ──────────────────
-                        # Allow NEUTRAL trend but BLOCK opposing trend
+                        # ── 6. EMA Trend filter ───────────────────────────
                         ob_needs_trend = "BULLISH" if ob["type"] == "BUY" else "BEARISH"
                         if trend != "NEUTRAL" and trend != ob_needs_trend:
                             print(f"  📊 {coin} {ob['type']} skipped — EMA trend is {trend}")
                             continue
 
-                        # ── 7. Retest volume check (NEW v5) ──────────────
+                        # ── 7. Retest volume check ────────────────────────
                         retest_weak = is_retest_volume_weak(ob, candles, price)
-                        # Not a hard block — but scored lower if volume is strong
 
-                        # ── 8. Minimum probability score (NEW v5) ─────────
+                        # ── 8. Minimum probability score ──────────────────
                         prob = calc_probability_score(ob, rsi, candles, trend, retest_weak)
                         if prob < MIN_PROB_SCORE:
                             print(f"  📉 {coin} {ob['type']} skipped — prob score {prob}% < {MIN_PROB_SCORE}%")
